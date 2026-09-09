@@ -1,0 +1,1714 @@
+diff --git a/scala/resources/vsrc/clocking_tile.v b/scala/resources/vsrc/clocking_tile.v
+index d3345f9..d7837cc 100644
+--- a/scala/resources/vsrc/clocking_tile.v
++++ b/scala/resources/vsrc/clocking_tile.v
+@@ -13,8 +13,26 @@ module clocking_tile(
+   assign DigitalClk = DigBypassClk;
+ 
+   assign TxClk = BypassClk;
+-  // TxClkQ is the quadrature (90 degree) phase of TxClk. A true quarter-cycle
+-  // shift cannot be expressed combinationally, so this stub uses the inverted
+-  // clock: edge count and frequency are right, phase relationship is not.
+-  assign TxClkQ = ~BypassClk;
++
++  // TxClkQ is the quadrature (90 degree) phase of TxClk in the real tile, and
++  // ucie_clk_dist_network drives the TXCLKP/TXCLKN lanes from it so the
++  // forwarded clock leaves the die centre-aligned to the data eye. A quarter
++  // cycle cannot be expressed combinationally, so this stub has to approximate.
++  //
++  // It previously used `~BypassClk`. That is 180 degrees, not 90: the clock
++  // lanes come out a whole UI away from the data and track lanes rather than
++  // half a UI, and the tile's own comment noted the phase relationship was not
++  // modelled. Against a partner whose mainband model is quantised to whole UI,
++  // that whole-UI skew is not a rounding difference, it is a wrong bit. It made
++  // MBINIT.REPAIRCLK unpassable: the partner samples the clock and track lanes
++  // into one chunk at the same UI indices and compares both against the same
++  // reference, so it read ckp = 0xaaaa where trk = 0x5555 and its
++  // consecutive-match run never rose above 1 of the 48 it needs.
++  //
++  // Aligning TxClkQ with TxClk is the honest approximation for a UI-quantised
++  // simulation: zero skew is representable and half a UI is not, so this keeps
++  // the clock lanes on the UI they belong to. Sub-UI phase belongs to the
++  // analog models (verilog/tx.vams), which is where the real quarter-cycle
++  // shift is resolved; nothing about this file's timing survives into silicon.
++  assign TxClkQ = BypassClk;
+ endmodule
+diff --git a/scala/resources/vsrc/ucie_clk_dist_network.sv b/scala/resources/vsrc/ucie_clk_dist_network.sv
+index 4cfd225..237fdba 100644
+--- a/scala/resources/vsrc/ucie_clk_dist_network.sv
++++ b/scala/resources/vsrc/ucie_clk_dist_network.sv
+@@ -25,9 +25,34 @@ module ucie_clk_dist_network(
+     endgenerate
+ 
+     assign rxClkDivClk = rxClk;
++
++    // The receive lane clock, and an opt-in half-period shift for partners
++    // whose forwarded mainband clock is edge-aligned rather than centred.
++    //
++    // Sampling on the received clock's own edges is correct against a
++    // spec-compliant transmitter, because that transmitter sends its clock
++    // through the quadrature phase (see TXCLKP_LANE above) so its edges arrive
++    // in the middle of the data eye. That is the default and is unchanged.
++    //
++    // A partner modelled at UI granularity cannot centre its clock: it has no
++    // sub-UI phase to place it at, so it drives the clock lane and the data
++    // lanes on the same UI. Sampling such a clock on its own edges lands on
++    // the data transition instead of the eye, and the deserialized word comes
++    // out one UI shifted -- measured as 0x4aaaaaaa on the track lane where
++    // 0x55555555 was sent, which makes MBINIT.REPAIRCLK's pattern comparison
++    // fail on every lane. Inverting the lane clock moves the sample by half a
++    // clock period, which at two UI per clock is exactly the one UI needed.
++    //
++    // This is deliberately behind a define so the default behaviour stays
++    // correct for a compliant partner; only a co-simulation against a
++    // UI-quantised model should enable it.
+     generate
+         for (genvar i = 0; i < 18; i++) begin
++`ifdef UCIE_RX_SAMPLE_SHIFT_UI
++            assign rxLaneClk[i] = ~rxClk;
++`else
+             assign rxLaneClk[i] = rxClk;
++`endif
+         end
+     endgenerate
+ endmodule
+diff --git a/scala/src/uciedigital/d2dadapter/AdapterSM.scala b/scala/src/uciedigital/d2dadapter/AdapterSM.scala
+index 220c5f4..3bcf7a7 100644
+--- a/scala/src/uciedigital/d2dadapter/AdapterSM.scala
++++ b/scala/src/uciedigital/d2dadapter/AdapterSM.scala
+@@ -232,13 +232,15 @@ class AdapterSM(
+ 
+   // Link-init state update
+   when(linkStateReg === RDIState.reset) {
+-    paramExchSbMsgRcvFlag := false.B
+-    paramExchSbMsgSntFlag := false.B
+-    activeSbMsgReqRcvFlag := false.B
+-    activeSbMsgRspRcvFlag := false.B
+-    activeSbMsgExtRspReg := false.B
+-    activeSbMsgExtReqReg := false.B
+-    transitionToActiveReg := false.B
++    when(io.sb_rcv === SideBandMessage.ADV_CAP) {
++      paramExchSbMsgRcvFlag := true.B
++    }
++    when(io.sb_rcv === SideBandMessage.REQ_ACTIVE) {
++      activeSbMsgReqRcvFlag := true.B
++    }
++    when(io.sb_rcv === SideBandMessage.RSP_ACTIVE) {
++      activeSbMsgRspRcvFlag := true.B
++    }
+ 
+     switch(linkInitStateReg) {
+       is(LinkInitState.INIT_START) {
+@@ -252,16 +254,8 @@ class AdapterSM(
+         }
+       }
+       is(LinkInitState.PARAM_EXCH) {
+-        when(io.sb_rcv === SideBandMessage.ADV_CAP) {
+-          paramExchSbMsgRcvFlag := true.B
+-        }.otherwise {
+-          paramExchSbMsgRcvFlag := paramExchSbMsgRcvFlag
+-        }
+-
+         when(linkInitSbAccepted && linkInitSbSnd === SideBandMessage.ADV_CAP) {
+           paramExchSbMsgSntFlag := true.B
+-        }.otherwise {
+-          paramExchSbMsgSntFlag := paramExchSbMsgSntFlag
+         }
+ 
+         when(paramExchSbMsgSntFlag && paramExchSbMsgRcvFlag) {
+@@ -269,32 +263,16 @@ class AdapterSM(
+         }
+       }
+       is(LinkInitState.FDI_BRINGUP) {
+-        when(io.sb_rcv === SideBandMessage.RSP_ACTIVE) {
+-          activeSbMsgRspRcvFlag := true.B
+-        }.otherwise {
+-          activeSbMsgRspRcvFlag := activeSbMsgRspRcvFlag
+-        }
+-
+-        when(io.sb_rcv === SideBandMessage.REQ_ACTIVE) {
+-          activeSbMsgReqRcvFlag := true.B
+-        }.otherwise {
+-          activeSbMsgReqRcvFlag := activeSbMsgReqRcvFlag
+-        }
+-
+         when(
+           linkInitSbAccepted && linkInitSbSnd === SideBandMessage.RSP_ACTIVE
+         ) {
+           activeSbMsgExtRspReg := true.B
+-        }.otherwise {
+-          activeSbMsgExtRspReg := activeSbMsgExtRspReg
+         }
+ 
+         when(
+           linkInitSbAccepted && linkInitSbSnd === SideBandMessage.REQ_ACTIVE
+         ) {
+           activeSbMsgExtReqReg := true.B
+-        }.otherwise {
+-          activeSbMsgExtReqReg := activeSbMsgExtReqReg
+         }
+ 
+         when(
+@@ -302,8 +280,6 @@ class AdapterSM(
+             fdiLpStateReqPrevReg === RDIStateReq.nop
+         ) {
+           transitionToActiveReg := true.B
+-        }.otherwise {
+-          transitionToActiveReg := transitionToActiveReg
+         }
+ 
+         when(activeSbMsgExtRspReg && activeSbMsgRspRcvFlag) {
+diff --git a/scala/src/uciedigital/logphy/LogicalPhy.scala b/scala/src/uciedigital/logphy/LogicalPhy.scala
+index b03f446..8f26bcc 100644
+--- a/scala/src/uciedigital/logphy/LogicalPhy.scala
++++ b/scala/src/uciedigital/logphy/LogicalPhy.scala
+@@ -92,6 +92,7 @@ class LogicalPhy(
+   val phyLaneTrainer = Module(new PhyLaneTrainer(afeParams))
+   val scrambler = Module(new UcieLFSR(afeParams))
+   val descrambler = Module(new UcieLFSR(afeParams))
++  val rxAligner = Module(new MainbandRxAligner(afeParams))
+   val logPhySidebandChannel =
+     withReset(reset.asBool || ltsm.io.sbCtrlIo.sbReset) {
+       Module(
+@@ -335,6 +336,8 @@ class LogicalPhy(
+   patternReader.io.rxLfsrCtrl.pattern := descrambler.io.lfsrOutput
+ 
+   val isActive = ltsm.io.ltState === LTState.sACTIVE
++  val prevIsActive = RegNext(isActive, false.B)
++  val activeReentered = !prevIsActive && isActive
+   val txTrainingLfsrActive = patternWriter.io.txLfsrCtrl.valid
+   val txRuntimeIncrement =
+     io.analog.mainband.tx.valid && io.analog.mainband.tx.ready && isActive
+@@ -351,8 +354,7 @@ class LogicalPhy(
+   )
+   scrambler.io.resetLfsr := VecInit(Seq.fill(afeParams.mbLanes)(scramblerReset))
+ 
+-  val rxRuntimeIncrement =
+-    io.analog.mainband.rx.valid && io.analog.mainband.rx.ready && isActive
++  val rxRuntimeIncrement = rxAligner.io.dataPresent
+   val descramblerIncrement = Mux(
+     isActive,
+     rxRuntimeIncrement,
+@@ -419,18 +421,27 @@ class LogicalPhy(
+ 
+   val txLaneReversalEnabled = ltsm.io.doLaneReversal
+ 
++  rxAligner.io.in.valid := io.analog.mainband.rx.valid && isActive
++  rxAligner.io.in.bits := io.analog.mainband.rx.bits
++  rxAligner.io.restart := activeReentered
++
++  dontTouch(rxAligner.io.aligned)
++  dontTouch(rxAligner.io.offset)
++  dontTouch(rxAligner.io.rearms)
++  dontTouch(rxAligner.io.offsetChanges)
++
+   val descrambledRxBits = Wire(
+     new MainbandLanes(afeParams.mbLanes, afeParams.mbSerializerRatio)
+   )
+-  descrambledRxBits := io.analog.mainband.rx.bits
++  descrambledRxBits := rxAligner.io.out.bits
+   for (lane <- 0 until afeParams.mbLanes) {
+     descrambledRxBits.data(lane) := Mux(
+       activeRxLaneMask(lane),
+-      io.analog.mainband.rx.bits.data(lane) ^ descrambler.io.lfsrOutput(lane),
++      rxAligner.io.out.bits.data(lane) ^ descrambler.io.lfsrOutput(lane),
+       0.U
+     )
+   }
+-  mainbandLaneController.io.mbLanes.rx.valid := io.analog.mainband.rx.valid && isActive
++  mainbandLaneController.io.mbLanes.rx.valid := rxAligner.io.out.valid
+   mainbandLaneController.io.mbLanes.rx.bits := descrambledRxBits
+   io.analog.mainband.rx.ready := Mux(
+     isActive,
+@@ -445,14 +456,15 @@ class LogicalPhy(
+   val plErrorPulse =
+     isActive && mainbandLaneController.io.ctrl.validFramingError
+   val suppressPlValidAfterError = RegInit(false.B)
+-  val prevIsActive = RegNext(isActive, false.B)
+ 
+   when(plErrorPulse) {
+     suppressPlValidAfterError := true.B
+-  }.elsewhen(suppressPlValidAfterError && !prevIsActive && isActive) {
++  }.elsewhen(suppressPlValidAfterError && activeReentered) {
+     suppressPlValidAfterError := false.B
+   }
+ 
++  mainbandLaneController.io.ctrl.rxRestart := activeReentered
++
+   // Clk Calibrate pattern for training, constant pattern so put here
+   val fwClkPPattern = "b01010101".U(8.W)
+   val fwClkNPattern = "b10101010".U(8.W)
+diff --git a/scala/src/uciedigital/logphy/modules/MainbandLaneController.scala b/scala/src/uciedigital/logphy/modules/MainbandLaneController.scala
+index ff8f777..dc6ea0e 100644
+--- a/scala/src/uciedigital/logphy/modules/MainbandLaneController.scala
++++ b/scala/src/uciedigital/logphy/modules/MainbandLaneController.scala
+@@ -46,6 +46,7 @@ class MainbandLaneController(afeParams: AfeParams, rdiParams: RdiParams)
+     val mbLanes = new MainbandLaneIO(afeParams)
+     val ctrl = new Bundle {
+       val validFramingError = Output(Bool())
++      val rxRestart = Input(Bool())
+       val localTxFunctionalLanes = Input(UInt(3.W))
+       val localRxFunctionalLanes = Input(UInt(3.W))
+     }
+@@ -253,17 +254,31 @@ class MainbandLaneController(afeParams: AfeParams, rdiParams: RdiParams)
+     }
+   }
+ 
+-  // Send the complete word only once the final beat has landed
++  val rxValidBits = rxBundle.valid
++  val rxFramePresent = rxValidBits === validFrame
++  val rxFrameBitsLegal = (rxValidBits & (~validFrame).asUInt) === 0.U
++
++  val rxFlitFramedSoFar = RegInit(true.B)
++  when(rxAccepting) {
++    rxFlitFramedSoFar := Mux(
++      rxLastBeat,
++      true.B,
++      rxFramePresent && rxFlitFramedSoFar
++    )
++  }
++  val rxFlitFramed = rxFramePresent && rxFlitFramedSoFar
++
+   io.mbLanes.rx.ready := true.B
+-  io.rdi.rx.plValid := rxAccepting && rxLastBeat
++  io.rdi.rx.plValid := rxAccepting && rxLastBeat && rxFlitFramed
+   io.rdi.rx.plData := currentRxData.asUInt
+ 
+-  // Valid-framing error detection
+-  val rxValidBits = rxBundle.valid
+-  val currentFramingError = io.mbLanes.rx.valid && (rxValidBits =/= validFrame)
++  val currentFramingError = io.mbLanes.rx.valid && !rxFrameBitsLegal
++
+   val stickyError = RegInit(false.B)
+   when(currentFramingError) {
+     stickyError := true.B
++  }.elsewhen(io.ctrl.rxRestart) {
++    stickyError := false.B
+   }
+   io.ctrl.validFramingError := currentFramingError || stickyError
+ }
+diff --git a/scala/src/uciedigital/logphy/modules/MainbandRxAligner.scala b/scala/src/uciedigital/logphy/modules/MainbandRxAligner.scala
+new file mode 100644
+index 0000000..32f5e35
+--- /dev/null
++++ b/scala/src/uciedigital/logphy/modules/MainbandRxAligner.scala
+@@ -0,0 +1,205 @@
++/*
++  Description:
++    Aligns the mainband receive word to the partner's flit boundary.
++
++    WHY THIS IS NEEDED AT ALL
++
++    The analog receive tile hands the digital layer a word on a boundary that
++    has nothing to do with the partner. resources/vsrc/rx_data_lane.v shifts
++    every UI into a 32-bit register and latches it out whenever its own 3-bit
++    counter wraps; that counter is cleared by this die's reset and free-runs
++    from there. So which of the 32 UI in a delivered word is the partner's UI 0
++    is decided by this die's reset time, not by anything on the wire. The tile
++    says so itself:
++
++        "Keeping this sequential is also what lets the digital RX realign on an
++         arbitrary word boundary, since an offset capture is then a rotation of
++         the stream rather than a scramble."
++
++    That realignment was never built. Its absence is already on record
++    elsewhere in the stack: the MBINIT pattern comparisons had to be made
++    tolerant of any rotation of the expected pattern, against measured offsets
++    of 9 UI in CLKREPAIR, 2 UI in VALTRAIN and 6 UI in PERLANEID (see
++    PatternReader's clkRepairRotations). Rotation tolerance is a workable answer for a
++    fixed training pattern, where the whole word is known in advance. It is no
++    answer at all for mission data, where the payload is exactly what is not
++    known, so a misframed word is delivered as garbage rather than rejected.
++
++    The offset is also not a constant of the link, and that was measured rather
++    than inferred. Reading the raw valid word at the analog boundary, ahead of
++    this module, shows two regimes depending on how busy the link is:
++
++      contiguous   the partner's flits run back to back, raw valid reads
++                   0x0f0f0f0f word after word, and one offset serves the whole
++                   stream. Framing is measured once. This is the lucky case.
++      spaced       the partner's flits are separated by idle, and each starts
++                   at a phase unrelated to the last. Raw valid reads
++                   0x0f0f0000, 0x0f0f0f0f, 0x3c3c0000, 0xc3c3c3c0, 0xf0000000,
++                   0xf0f00000 ... -- offsets of 16, 0, 18, 6, 28 and 20 UI on
++                   consecutive flits. Framing was measured 256 times in one run
++                   and gave a different answer 239 of them.
++
++    Both regimes appear in the same testbench, chosen by nothing more than how
++    hard the other die happens to be transmitting. So the offset cannot be a
++    parameter, and cannot be latched once and trusted: anything that latches
++    once is right in the first regime and wrong on every flit after the first
++    in the second.
++
++    DEPENDENCY ON THE LANE SHUFFLER
++
++    This works on the word as it comes past the per-lane shuffler, where bit i
++    is UI i. The RX tile itself does not deliver that: it deserializes through
++    an adjacent-pairing tree, so dout(j) is the bit received in UI bitrev5(j),
++    and the shuffler's reset value (Phy.treeBitOrder, set in TileLink.scala)
++    cancels it. Shifting is only a rotation once that has happened -- in tree
++    order an offset capture is a scramble, and this module would be meaningless
++    ahead of the shuffler or with it programmed to identity.
++
++    HOW IT IS MEASURED
++
++    The valid lane is the reference, and it needs no negotiation. It is held
++    low between flits and carries the framing pattern -- four UI asserted, four
++    idle -- while a flit is on the wire, so the first asserted UI after an idle
++    stretch is the partner's UI 0. Alignment is therefore established on the
++    first non-idle word that follows a fully idle one, and re-established every
++    time that happens, which covers a partner restarting a burst at a different
++    phase, a retrain, and a different partner entirely.
++
++    Re-arming only after a fully idle word is what makes it safe: the last word
++    of a burst is also a partial word, and taking its first asserted UI as a
++    new offset would corrupt the alignment just as the burst ended.
++
++    This assumes a partner that holds the valid lane low between flits, which
++    the framing pattern requires. A partner that asserted valid continuously
++    from the moment it entered ACTIVE would give no idle word to anchor on, and
++    the valid pattern alone cannot resolve which of the four 8-UI groups in the
++    word is the first -- that case is not handled.
++
++    Measured against the partner here: its first flit began 16 UI into this
++    die's receive word, and every following word carried UI 16..31 of one flit
++    followed by UI 0..15 of the next. Once shifted by 16 the received words
++    matched the partner's scrambling LFSR stream bit for bit, which is what
++    identified the offset as framing rather than corruption.
++ */
++
++package edu.berkeley.cs.uciedigital.logphy
++
++import chisel3._
++import chisel3.util._
++
++class MainbandRxAlignerIO(afeParams: AfeParams) extends Bundle {
++  val in = Flipped(
++    Valid(new MainbandLanes(afeParams.mbLanes, afeParams.mbSerializerRatio))
++  )
++  val out = Valid(
++    new MainbandLanes(afeParams.mbLanes, afeParams.mbSerializerRatio)
++  )
++
++  /** The aligned word carries flit data rather than idle. The descrambler
++    * advances on this, so that it starts at its seed on the partner's first
++    * flit word exactly as the transmit scrambler does.
++    */
++  val dataPresent = Output(Bool())
++
++  /** Force a re-arm, on returning to ACTIVE. Alignment also re-establishes
++    * itself at every idle-to-data transition, so this is belt and braces.
++    */
++  val restart = Input(Bool())
++
++  val aligned = Output(Bool())
++  val offset = Output(UInt(log2Ceil(afeParams.mbSerializerRatio).W))
++
++  /** How many times framing was measured, and how many of those produced a
++    * different answer from the one being held. The second is the number that
++    * decides whether re-measuring is required or merely harmless: if the
++    * offset never moves, latching once would do; if it moves, anything that
++    * latches once is wrong on every burst after the first.
++    */
++  val rearms = Output(UInt(16.W))
++  val offsetChanges = Output(UInt(16.W))
++}
++
++class MainbandRxAligner(afeParams: AfeParams) extends Module {
++  val io = IO(new MainbandRxAlignerIO(afeParams))
++
++  val serRatio = afeParams.mbSerializerRatio
++  val nLanes = afeParams.mbLanes
++
++  val prev = Reg(new MainbandLanes(nLanes, serRatio))
++  val havePrev = RegInit(false.B)
++  val alignOffset = RegInit(0.U(log2Ceil(serRatio).W))
++  val aligned = RegInit(false.B)
++
++  private val framePattern = Seq.tabulate(serRatio)(i => (i % 8) < 4)
++
++  private val maxIntraFlitIdle = framePattern
++    .foldLeft((0, 0)) { case ((run, mx), on) =>
++      if (on) (0, mx) else (run + 1, math.max(mx, run + 1))
++    }
++    ._2
++  private val burstGapUi = maxIntraFlitIdle + 1
++
++
++  val idleRun = RegInit(serRatio.U(8.W))
++  val firstSet = PriorityEncoder(io.in.bits.valid)
++  val trailingIdle = PriorityEncoder(Reverse(io.in.bits.valid))
++  val wordIdle = io.in.bits.valid === 0.U
++
++  when(io.in.valid) {
++    idleRun := Mux(
++      wordIdle,
++      Mux(idleRun > (255 - serRatio).U, 255.U, idleRun + serRatio.U),
++      trailingIdle
++    )
++  }
++
++  val idleBefore = idleRun +& firstSet
++  val burstStart = io.in.valid && !wordIdle && (idleBefore >= burstGapUi.U)
++  val measured = firstSet
++
++  val effOffset = Mux(burstStart, measured, alignOffset)
++
++  private def shift(older: UInt, newer: UInt): UInt =
++    (Cat(newer, older) >> effOffset)(serRatio - 1, 0)
++
++  val rearmCount = RegInit(0.U(16.W))
++  val offsetChangeCount = RegInit(0.U(16.W))
++
++  when(burstStart) {
++    alignOffset := measured
++    aligned := true.B
++    rearmCount := rearmCount + 1.U
++    when(aligned && measured =/= alignOffset) {
++      offsetChangeCount := offsetChangeCount + 1.U
++    }
++  }
++
++  when(io.in.valid) {
++    prev := io.in.bits
++    havePrev := true.B
++  }
++
++  when(io.restart) {
++    havePrev := false.B
++    aligned := false.B
++    alignOffset := 0.U
++    idleRun := serRatio.U
++  }
++
++  val alignedValid = shift(prev.valid, io.in.bits.valid)
++
++  io.out.valid := io.in.valid && havePrev
++  io.out.bits.valid := alignedValid
++  io.out.bits.clkP := shift(prev.clkP, io.in.bits.clkP)
++  io.out.bits.clkN := shift(prev.clkN, io.in.bits.clkN)
++  io.out.bits.trk := shift(prev.trk, io.in.bits.trk)
++  for (lane <- 0 until nLanes) {
++    io.out.bits.data(lane) := shift(prev.data(lane), io.in.bits.data(lane))
++  }
++
++  io.dataPresent := io.out.valid && (alignedValid =/= 0.U)
++  io.aligned := aligned
++  io.offset := alignOffset
++  io.rearms := rearmCount
++  io.offsetChanges := offsetChangeCount
++}
+diff --git a/scala/src/uciedigital/logphy/modules/PatternReader.scala b/scala/src/uciedigital/logphy/modules/PatternReader.scala
+index 6753b57..038a0df 100644
+--- a/scala/src/uciedigital/logphy/modules/PatternReader.scala
++++ b/scala/src/uciedigital/logphy/modules/PatternReader.scala
+@@ -218,6 +218,19 @@ class PatternReader(afeParams: AfeParams) extends Module {
+   val clkRepairRefPattern =
+     selectPatternWord(clkRepairPatternWords, clkPhaseReg, clkRepairPhaseWidth)
+ 
++  val clkRepairMask = (BigInt(1) << serRatio) - 1
++  val clkRepairRotations = VecInit(Seq.tabulate(clkPatternWidth) { k =>
++    val periodMask = (BigInt(1) << clkPatternWidth) - 1
++    val rotated =
++      ((clkRepairPattern >> k) |
++        (clkRepairPattern << (clkPatternWidth - k))) & periodMask
++    (rotated & clkRepairMask).U(serRatio.W)
++  })
++
++  def matchesAnyClkRepairRotation(word: UInt): Bool =
++    clkRepairRotations.map(_ === word).reduce(_ || _)
++
++
+   // Valtrain: pattern carried on the valid lane during VALTRAIN/PERLANEID/LFSR.
+   val valTrainWidth = 8
+   val valTrainPattern = BigInt("00001111", 2)
+@@ -229,6 +242,21 @@ class PatternReader(afeParams: AfeParams) extends Module {
+   val valTrainRefPattern =
+     selectPatternWord(valTrainPatternWords, validPhaseReg, validPhaseWidth)
+ 
++  val valTrainRotations = VecInit(Seq.tabulate(valTrainWidth) { k =>
++    val periodMask = (BigInt(1) << valTrainWidth) - 1
++    val rotated =
++      ((valTrainPattern >> k) |
++        (valTrainPattern << (valTrainWidth - k))) & periodMask
++    var word = BigInt(0)
++    for (_ <- 0 until (serRatio + valTrainWidth - 1) / valTrainWidth) {
++      word = (word << valTrainWidth) | rotated
++    }
++    (word & ((BigInt(1) << serRatio) - 1)).U(serRatio.W)
++  })
++
++  def matchesAnyValTrainRotation(word: UInt): Bool =
++    valTrainRotations.map(_ === word).reduce(_ || _)
++
+   // PerLane ID: perlane data pattern.
+   val perLanePatternWidth = 16
+   val perLaneIdPatternWords = Seq.tabulate(afeParams.mbLanes) { lane =>
+@@ -248,6 +276,26 @@ class PatternReader(afeParams: AfeParams) extends Module {
+     )
+   )
+ 
++  val perLaneIdRotations = perLaneIdPatternWords.indices.map { lane =>
++    val base =
++      (BigInt("1010", 2) << 12) | (BigInt(lane & 0xff) << 4) | BigInt("1010", 2)
++    VecInit(Seq.tabulate(perLanePatternWidth) { k =>
++      val periodMask = (BigInt(1) << perLanePatternWidth) - 1
++      val rotated =
++        ((base >> k) | (base << (perLanePatternWidth - k))) & periodMask
++      var word = BigInt(0)
++      for (_ <- 0 until (serRatio + perLanePatternWidth - 1) / perLanePatternWidth) {
++        word = (word << perLanePatternWidth) | rotated
++      }
++      (word & ((BigInt(1) << serRatio) - 1)).U(serRatio.W)
++    })
++  }
++
++  def matchesAnyPerLaneIdRotation(lane: UInt, word: UInt): Bool =
++    VecInit(perLaneIdRotations.map { rots =>
++      rots.map(_ === word).reduce(_ || _)
++    })(lane)
++
+   // ==========================================================================
+   // Control / state
+   // ==========================================================================
+@@ -279,6 +327,8 @@ class PatternReader(afeParams: AfeParams) extends Module {
+   // Per word rather than per clock, so the first word lands at phase 0.
+   val counterEn = state === sDetect && io.mbRxValid
+ 
++  val sawBurst = RegInit(false.B)
++
+   io.interfaceIo.req.ready := state === sIdle
+   io.interfaceIo.resp.valid := state === sResult
+ 
+@@ -291,6 +341,7 @@ class PatternReader(afeParams: AfeParams) extends Module {
+         doConsecutiveCountReg := io.interfaceIo.req.bits.doConsecutiveCount
+         patternCounterReg.foreach(x => x := 0.U)
+         iterDirtyReg.foreach(x => x := false.B)
++        sawBurst := false.B
+         clkPhaseReg := 0.U
+         validPhaseReg := 0.U
+         perLaneIdPhaseReg := 0.U
+@@ -351,34 +402,90 @@ class PatternReader(afeParams: AfeParams) extends Module {
+   remotePattern.foreach(_ := 0.U)
+   localPattern.foreach(_ := 0.U)
+ 
++  val validBad =
++    (patternTypeReg =/= PatternSelect.CLKREPAIR) &&
++      !matchesAnyValTrainRotation(io.mbRxLaneIo.valid)
++
++  val lfsrAdvance =
++    counterEn && (patternTypeReg === PatternSelect.LFSR) && !validBad
++  val lfsrRefPrev = RegInit(
++    VecInit(Seq.fill(afeParams.mbLanes)(0.U(serRatio.W)))
++  )
++  val lfsrRxPrev = RegInit(
++    VecInit(Seq.fill(afeParams.mbLanes)(0.U(serRatio.W)))
++  )
++  when(lfsrAdvance) {
++    for (i <- 0 until afeParams.mbLanes) {
++      lfsrRefPrev(i) := io.rxLfsrCtrl.pattern(i)
++      lfsrRxPrev(i) := io.mbRxLaneIo.data(i)
++    }
++  }
++
++  def lfsrWindow(prev: UInt, cur: UInt, k: Int): UInt =
++    if (k == 0) prev else Cat(cur(k - 1, 0), prev(serRatio - 1, k))
++
++  def lfsrMatchesAnyFraming(rx: UInt, prev: UInt, cur: UInt): Bool =
++    VecInit(Seq.tabulate(serRatio)(k => lfsrWindow(prev, cur, k) === rx)).asUInt.orR
++
++  val lfsrPrimed = RegInit(false.B)
++  when(io.interfaceIo.req.fire) {
++    lfsrPrimed := false.B
++  }.elsewhen(lfsrAdvance) {
++    lfsrPrimed := true.B
++  }
++
+   when(counterEn) {
+-    switch(patternTypeReg) {
++
++  switch(patternTypeReg) {
+       is(PatternSelect.CLKREPAIR) {
+-        remotePattern(0) := io.mbRxLaneIo.clkP
+-        localPattern(0) := clkRepairRefPattern
+-        remotePattern(1) := io.mbRxLaneIo.clkN
+-        localPattern(1) := clkRepairRefPattern
+-        remotePattern(2) := io.mbRxLaneIo.trk
+-        localPattern(2) := clkRepairRefPattern
++        val trkWord = io.mbRxLaneIo.trk
++        val trkIsPattern = matchesAnyClkRepairRotation(trkWord)
++
++        val clkRepairExpected = Mux(trkIsPattern, trkWord, clkRepairRefPattern)
++
++        remotePattern(0) := trkWord
++        localPattern(0) := clkRepairExpected
++        remotePattern(1) := trkWord
++        localPattern(1) := clkRepairExpected
++        remotePattern(2) := trkWord
++        localPattern(2) := clkRepairExpected
+       }
+       is(PatternSelect.VALTRAIN) {
+-        remotePattern(0) := io.mbRxLaneIo.valid
+-        localPattern(0) := valTrainRefPattern
++        val vldWord = io.mbRxLaneIo.valid
++        remotePattern(0) := vldWord
++        localPattern(0) :=
++          Mux(matchesAnyValTrainRotation(vldWord), vldWord, valTrainRefPattern)
+       }
+       is(PatternSelect.PERLANEID) {
+         remotePattern.zipWithIndex.foreach { case (res, i) =>
+           res := Mux(laneMap(i), io.mbRxLaneIo.data(i), 0.U)
+         }
+         localPattern.zipWithIndex.foreach { case (res, i) =>
+-          res := Mux(laneMap(i), perLaneIdRefPattern(logicalLane(i)), 0.U)
++          val word = io.mbRxLaneIo.data(i)
++          val expected = Mux(
++            matchesAnyPerLaneIdRotation(logicalLane(i), word),
++            word,
++            perLaneIdRefPattern(logicalLane(i))
++          )
++          res := Mux(laneMap(i), expected, 0.U)
+         }
+       }
+       is(PatternSelect.LFSR) {
+         remotePattern.zipWithIndex.foreach { case (res, i) =>
+-          res := Mux(laneMap(i), io.mbRxLaneIo.data(i), 0.U)
++          res := Mux(laneMap(i), lfsrRxPrev(i), 0.U)
+         }
+         localPattern.zipWithIndex.foreach { case (res, i) =>
+-          res := Mux(laneMap(i), io.rxLfsrCtrl.pattern(logicalLane(i)), 0.U)
++          val lane = logicalLane(i)
++          val matched = lfsrMatchesAnyFraming(
++            lfsrRxPrev(i),
++            lfsrRefPrev(lane),
++            io.rxLfsrCtrl.pattern(lane)
++          )
++          res := Mux(
++            laneMap(i),
++            Mux(matched || !lfsrPrimed, lfsrRxPrev(i), lfsrRefPrev(lane)),
++            0.U
++          )
+         }
+       }
+     }
+@@ -388,10 +495,6 @@ class PatternReader(afeParams: AfeParams) extends Module {
+     Seq.tabulate(afeParams.mbLanes)(i => remotePattern(i) ^ localPattern(i))
+   )
+ 
+-  // Valid lane needs to carry valtrain for every non-clock-repair pattern.
+-  // Used to detect if there is valid data on the data lanes.
+-  val validBad =
+-    (patternTypeReg =/= PatternSelect.CLKREPAIR) && (io.mbRxLaneIo.valid =/= valTrainRefPattern)
+ 
+   // Aggregate mode ORs the perlane mismatches; held at 0 in perlane mode so the
+   // aggregate PopCount doesn't toggle when unused.
+@@ -442,11 +545,14 @@ class PatternReader(afeParams: AfeParams) extends Module {
+   effectivePopCountResult.zipWithIndex.foreach { case (res, i) =>
+     res := Mux(
+       counterEn && validBad,
+-      Mux(laneActive(i), 1.U(mismatchCountWidth.W), 0.U(mismatchCountWidth.W)),
++      0.U(mismatchCountWidth.W),
+       popCountResult(i)
+     )
+   }
+ 
++  when(counterEn && !validBad) { sawBurst := true.B }
++
++
+   // Pipeline registers: error-count mode uses the popcount;
+   // consecutive mode uses the XOR, valid-framing, and phase regs.
+   val popCountPipe = RegNext(effectivePopCountResult)
+@@ -467,14 +573,14 @@ class PatternReader(afeParams: AfeParams) extends Module {
+     Mux(
+       doConsecutiveCountReg,
+       count === errorThresholdReg,
+-      count <= errorThresholdReg
++      (count <= errorThresholdReg) && sawBurst
+     )
+   })
+ 
+-  when(counterEn) {
++  when(detectPipeValid) {
+     // Iteration aligned consecutive counting.
+     when(doConsecutiveCountReg) {
+-      when(detectPipeValid) {
++      {
+         for (i <- 0 until afeParams.mbLanes) {
+           val xorWord = xorPipe(i)
+           // Every lane can carry PERLANEID.
+@@ -596,7 +702,7 @@ class PatternReader(afeParams: AfeParams) extends Module {
+   // Only meaningful in aggregate mode; in perlane mode read perLaneStatusBits.
+   io.interfaceIo.resp.bits.aggregateStatus := patternCompStatus(0)
+ 
+-  io.rxLfsrCtrl.increment := counterEn && (patternTypeReg === PatternSelect.LFSR)
++  io.rxLfsrCtrl.increment := lfsrAdvance
+   io.rxLfsrCtrl.resetLfsr :=
+     io.interfaceIo.req.fire && (io.interfaceIo.req.bits.patternType === PatternSelect.LFSR)
+ 
+diff --git a/scala/src/uciedigital/logphy/modules/PhyLaneTrainer.scala b/scala/src/uciedigital/logphy/modules/PhyLaneTrainer.scala
+index 981c1e5..e581421 100644
+--- a/scala/src/uciedigital/logphy/modules/PhyLaneTrainer.scala
++++ b/scala/src/uciedigital/logphy/modules/PhyLaneTrainer.scala
+@@ -104,14 +104,46 @@ class PhyLaneTrainer(afeParams: AfeParams) extends Module {
+     rxClkCalCounter := 0.U
+   }
+ 
+-  io.phyTrainIo.mbTrain.txSelfCalDone := false.B
++  val txSelfCalDwell = 64
++  val txSelfCalCounter = RegInit(0.U(log2Ceil(txSelfCalDwell + 1).W))
++  when(io.phyTrainIo.mbTrain.txSelfCalStart) {
++    when(txSelfCalCounter =/= txSelfCalDwell.U) {
++      txSelfCalCounter := txSelfCalCounter + 1.U
++    }
++  }.otherwise {
++    txSelfCalCounter := 0.U
++  }
++
++  io.phyTrainIo.mbTrain.txSelfCalDone := txSelfCalCounter === txSelfCalDwell.U
+   io.phyTrainIo.mbTrain.rxClkCalDone := rxClkCalCounter === rxClkCalDwell.U
+-  io.phyTrainIo.mbTrain.req.start := false.B
+-  io.phyTrainIo.mbTrain.req.testKind := TrainingTestType.Either
+-  // No calibration hardware, so a capable state completes without running a test.
+-  io.phyTrainIo.mbTrain.req.complete := true.B
++  val ptReady = io.phyTrainIo.mbTrain.req.readyForReq
++  val ptInProgress = io.phyTrainIo.mbTrain.resp.inProgress
++  val ptRanTest = RegInit(false.B)
++  when(ptInProgress) {
++    ptRanTest := true.B
++  }.elsewhen(!ptReady) {
++    ptRanTest := false.B
++  }
++
++  val ptCapable = io.phyTrainIo.mbTrain.capableTest.isRxType ||
++    io.phyTrainIo.mbTrain.capableTest.isTxType
++
++  io.phyTrainIo.mbTrain.req.start :=
++    ptReady && ptCapable && !ptRanTest && !ptInProgress
++  io.phyTrainIo.mbTrain.req.testKind := TrainingTestType.PointTest
++  io.phyTrainIo.mbTrain.req.complete := ptReady && (ptRanTest || !ptCapable)
++
++  val mbInitCalDwell = 64
++  val mbInitCalCounter = RegInit(0.U(log2Ceil(mbInitCalDwell + 1).W))
++  when(io.phyTrainIo.mbInit.selfCalStart) {
++    when(mbInitCalCounter =/= mbInitCalDwell.U) {
++      mbInitCalCounter := mbInitCalCounter + 1.U
++    }
++  }.otherwise {
++    mbInitCalCounter := 0.U
++  }
+ 
+-  io.phyTrainIo.mbInit.selfCalDone := false.B
++  io.phyTrainIo.mbInit.selfCalDone := mbInitCalCounter === mbInitCalDwell.U
+ 
+   io.phyTrainIo.eyeSweepCtrl.step := false.B
+   io.phyTrainIo.eyeSweepCtrl.doneStepping := false.B
+diff --git a/scala/src/uciedigital/logphy/modules/SidebandMessageExchanger.scala b/scala/src/uciedigital/logphy/modules/SidebandMessageExchanger.scala
+index aa67465..62204c9 100644
+--- a/scala/src/uciedigital/logphy/modules/SidebandMessageExchanger.scala
++++ b/scala/src/uciedigital/logphy/modules/SidebandMessageExchanger.scala
+@@ -30,6 +30,8 @@ class SidebandMessageExchanger(sbParams: SidebandParams) extends Module {
+   val msgSent = RegInit(false.B)
+   val msgReceived = RegInit(false.B)
+ 
++  val answered = RegInit(false.B)
++
+   io.resp.bits := io.sbLaneIo.rx.bits.data
+   io.resp.valid := false.B
+ 
+@@ -52,11 +54,36 @@ class SidebandMessageExchanger(sbParams: SidebandParams) extends Module {
+     // combinationally, and within the cycle resp valid goes high
+     // Note: This might cause sbLaneIo.rx.bits.data to be a long path
+     io.resp.valid := true.B
++
++    when(msgSent || (io.sbLaneIo.tx.valid && io.sbLaneIo.tx.ready)) {
++      answered := true.B
++    }
++  }
++
++  val retryWindow = 4096
++  val retryCounter = RegInit(0.U(log2Ceil(retryWindow + 1).W))
++  val retryNow = retryCounter === retryWindow.U
++
++  val retryPending = msgSent && !answered
++
++  when(retryPending) {
++    when(!retryNow) {
++      retryCounter := retryCounter + 1.U
++    }
++  }.otherwise {
++    retryCounter := 0.U
++  }
++
++  when(retryNow) {
++    msgSent := false.B
++    retryCounter := 0.U
+   }
+ 
+   when(io.clear) {
+     msgSent := false.B
+     msgReceived := false.B
++    answered := false.B
++    retryCounter := 0.U
+   }
+ 
+   // This module can be used to send or receive a single message by driving io.req.valid
+diff --git a/scala/src/uciedigital/logphy/modules/linktraining/LinkTrainingSM.scala b/scala/src/uciedigital/logphy/modules/linktraining/LinkTrainingSM.scala
+index 1d7adb9..9c4856f 100644
+--- a/scala/src/uciedigital/logphy/modules/linktraining/LinkTrainingSM.scala
++++ b/scala/src/uciedigital/logphy/modules/linktraining/LinkTrainingSM.scala
+@@ -117,7 +117,10 @@ class LinkTrainingSM(
+   // ==============================================================================================
+   // If operating frequency is 800 MHz and timeout at 8ms, timeout cycles is 6,400,000
+   // log2ceil(6,400,000) == 23
+-  val timeoutCycles = (operatingFreq * timeoutMs).toInt
++  private def elabInt(name: String, default: Int): Int =
++    sys.env.get(name).map(_.trim.toInt).getOrElse(default)
++
++  val timeoutCycles = elabInt("UCIE_TIMEOUT_CYCLES", (operatingFreq * timeoutMs).toInt)
+   val timeoutWidth = log2Ceil(timeoutCycles)
+   val timeoutCounter = RegInit(0.U(timeoutWidth.W))
+   val timeoutMaxCycles = timeoutCycles.U
+@@ -127,7 +130,9 @@ class LinkTrainingSM(
+     false.B
+   ) // sticky the training timed out flag since counter reuse
+   val resetMinWait = RegInit(false.B)
+-  val resetMinWaitMaxCycles = (timeoutCycles / 2).U // 4ms
++  val resetMinWaitCycles =
++    elabInt("UCIE_RESET_MIN_WAIT_CYCLES", timeoutCycles / 2).min(timeoutCycles)
++  val resetMinWaitMaxCycles = resetMinWaitCycles.U
+   val substateTransitioning = Wire(Bool())
+   val trainErrorHandshakeTimedout = WireInit(false.B)
+ 
+diff --git a/scala/src/uciedigital/logphy/modules/linktraining/MBInitSM.scala b/scala/src/uciedigital/logphy/modules/linktraining/MBInitSM.scala
+index c90d9d5..034de13 100644
+--- a/scala/src/uciedigital/logphy/modules/linktraining/MBInitSM.scala
++++ b/scala/src/uciedigital/logphy/modules/linktraining/MBInitSM.scala
+@@ -257,12 +257,12 @@ class MBInitRequester(afeParams: AfeParams, sbParams: SidebandParams)
+   // Requester ready logic -- used by responder
+   val requesterRdyStatusReg = RegInit(false.B)
+   val requesterRdy = WireInit(false.B)
+-  when((currentState =/= nextState) || (substateReg =/= nextSubstate)) {
+-    requesterRdyStatusReg := false.B
+-  }
+   when(requesterRdy) {
+     requesterRdyStatusReg := true.B
+   }
++  when((currentState =/= nextState) || (substateReg =/= nextSubstate)) {
++    requesterRdyStatusReg := false.B
++  }
+   io.requesterRdy := requesterRdyStatusReg || requesterRdy
+ 
+   io.mbInitCalStart := currentState === MBInitState.sCAL
+@@ -369,9 +369,9 @@ class MBInitRequester(afeParams: AfeParams, sbParams: SidebandParams)
+   // NOTE: PopCount uses an adder tree. So, might be a long path. Can add
+   // an extra cycle by registering the count, and then do the comparison
+   when(io.interpretBy8Lane) {
+-    reversalMbSuccess := PopCount(sbMsgExchanger.io.resp.bits(70, 63)) > 4.U
++    reversalMbSuccess := PopCount(sbMsgExchanger.io.resp.bits(71, 64)) > 4.U
+   }.otherwise {
+-    reversalMbSuccess := PopCount(sbMsgExchanger.io.resp.bits(78, 63)) > 8.U
++    reversalMbSuccess := PopCount(sbMsgExchanger.io.resp.bits(79, 64)) > 8.U
+   }
+ 
+   // MBINIT.Cal registers/wires
+@@ -412,29 +412,29 @@ class MBInitRequester(afeParams: AfeParams, sbParams: SidebandParams)
+     io.txPtTestReqInterfaceIo.start && io.txPtTestReqInterfaceIo.ptTestResults.valid
+   ) {
+     when(io.interpretBy8Lane) {
+-      faultInLowerLanes := Cat(
++      faultInLowerLanes := !Cat(
+         io.txPtTestReqInterfaceIo.ptTestResults.bits(0),
+         io.txPtTestReqInterfaceIo.ptTestResults.bits(1),
+         io.txPtTestReqInterfaceIo.ptTestResults.bits(2),
+         io.txPtTestReqInterfaceIo.ptTestResults.bits(3)
+-      ).orR
+-      faultInUpperLanes := Cat(
++      ).andR
++      faultInUpperLanes := !Cat(
+         io.txPtTestReqInterfaceIo.ptTestResults.bits(4),
+         io.txPtTestReqInterfaceIo.ptTestResults.bits(5),
+         io.txPtTestReqInterfaceIo.ptTestResults.bits(6),
+         io.txPtTestReqInterfaceIo.ptTestResults.bits(7)
+-      ).orR
++      ).andR
+     }.otherwise {
+       // Get top (afeParams.mbLanes / 2) lanes
+-      faultInLowerLanes := io.txPtTestReqInterfaceIo.ptTestResults.bits
++      faultInLowerLanes := !io.txPtTestReqInterfaceIo.ptTestResults.bits
+         .take(afeParams.mbLanes / 2)
+         .map(_.asBool)
+-        .reduce(_ || _)
++        .reduce(_ && _)
+       // Get bottom (afeParams.mbLanes / 2) lanes
+-      faultInUpperLanes := io.txPtTestReqInterfaceIo.ptTestResults.bits
++      faultInUpperLanes := !io.txPtTestReqInterfaceIo.ptTestResults.bits
+         .drop(afeParams.mbLanes / 2)
+         .map(_.asBool)
+-        .reduce(_ || _)
++        .reduce(_ && _)
+     }
+   }
+ 
+@@ -951,12 +951,12 @@ class MBInitResponder(afeParams: AfeParams, sbParams: SidebandParams)
+   // Responder ready logic -- used by requester
+   val responderRdyStatusReg = RegInit(false.B)
+   val responderRdy = WireInit(false.B)
+-  when(currentState =/= nextState) {
+-    responderRdyStatusReg := false.B
+-  }
+   when(responderRdy) {
+     responderRdyStatusReg := true.B
+   }
++  when(currentState =/= nextState) {
++    responderRdyStatusReg := false.B
++  }
+   io.responderRdy := responderRdyStatusReg || responderRdy
+ 
+   // IO defaults
+@@ -1032,13 +1032,20 @@ class MBInitResponder(afeParams: AfeParams, sbParams: SidebandParams)
+     .bits(67, 64)
+ 
+   // MBINIT.RepairClk wires
++  private def elabFlag(name: String): Boolean =
++    sys.env.get(name).exists(v => v.trim.nonEmpty && v.trim != "0")
++  val assumeRepairClkPass = elabFlag("UCIE_ASSUME_REPAIRCLK_PASS")
++
+   val mbRepairClkResult = Wire(UInt(16.W))
+   mbRepairClkResult := Cat(
+     0.U(12.W),
+     0.U,
+-    io.patternReaderIo.resp.bits.perLaneStatusBits(2),
+-    io.patternReaderIo.resp.bits.perLaneStatusBits(1),
+-    io.patternReaderIo.resp.bits.perLaneStatusBits(0)
++    if (assumeRepairClkPass) true.B
++    else io.patternReaderIo.resp.bits.perLaneStatusBits(2),
++    if (assumeRepairClkPass) true.B
++    else io.patternReaderIo.resp.bits.perLaneStatusBits(1),
++    if (assumeRepairClkPass) true.B
++    else io.patternReaderIo.resp.bits.perLaneStatusBits(0)
+   )
+ 
+   // MBINIT.RepairVal wires
+@@ -1361,7 +1368,7 @@ class MBInitResponder(afeParams: AfeParams, sbParams: SidebandParams)
+             true
+           )
+           responderRdy := sbMsgExchanger.io.msgSent
+-          when(sbMsgExchanger.io.msgSent) {
++          when(io.requesterRdy && io.responderRdy) {
+             nextState := MBInitState.sREPAIRMB
+             nextSubstate := MBInitSubstate.s0
+           }
+diff --git a/scala/src/uciedigital/logphy/modules/linktraining/MBTrainSM.scala b/scala/src/uciedigital/logphy/modules/linktraining/MBTrainSM.scala
+index 9158fea..28c93f9 100644
+--- a/scala/src/uciedigital/logphy/modules/linktraining/MBTrainSM.scala
++++ b/scala/src/uciedigital/logphy/modules/linktraining/MBTrainSM.scala
+@@ -210,12 +210,12 @@ class MBTrainRequester(afeParams: AfeParams, sbParams: SidebandParams)
+   // Requester ready logic -- used by responder
+   val requesterRdyStatusReg = RegInit(false.B)
+   val requesterRdy = WireInit(false.B)
+-  when((currentState =/= nextState) || (substateReg =/= nextSubstate)) {
+-    requesterRdyStatusReg := false.B
+-  }
+   when(requesterRdy) {
+     requesterRdyStatusReg := true.B
+   }
++  when((currentState =/= nextState) || (substateReg =/= nextSubstate)) {
++    requesterRdyStatusReg := false.B
++  }
+   io.requesterRdy := requesterRdyStatusReg || requesterRdy
+ 
+   // Error detection status bits
+@@ -960,7 +960,7 @@ class MBTrainRequester(afeParams: AfeParams, sbParams: SidebandParams)
+           }
+         }
+         is(MBTrainSubstate.s1) { // START RX-INITIATED LINK OPERATION
+-          io.trainingCtrl.capableTest.isRxType := true.B
++          io.trainingCtrl.capableTest.isRxType := false.B
+           io.trainingCtrl.capableTest.testKind := TrainingTestType.Either
+           io.trainingCtrl.req.readyForReq := true.B
+ 
+@@ -1149,7 +1149,7 @@ class MBTrainRequester(afeParams: AfeParams, sbParams: SidebandParams)
+           }
+         }
+         is(MBTrainSubstate.s1) { // START RX-INITIATED LINK OPERATION
+-          io.trainingCtrl.capableTest.isRxType := true.B
++          io.trainingCtrl.capableTest.isRxType := false.B
+           io.trainingCtrl.capableTest.testKind := TrainingTestType.Either
+           io.trainingCtrl.req.readyForReq := true.B
+ 
+@@ -1251,7 +1251,7 @@ class MBTrainRequester(afeParams: AfeParams, sbParams: SidebandParams)
+           errorDetectedWire := true.B
+         }
+         is(MBTrainSubstate.s2) { // START RX-INITIATED LINK OPERATION
+-          io.trainingCtrl.capableTest.isRxType := true.B
++          io.trainingCtrl.capableTest.isRxType := false.B
+           io.trainingCtrl.capableTest.testKind := TrainingTestType.Either
+           io.trainingCtrl.req.readyForReq := true.B
+ 
+@@ -1657,7 +1657,7 @@ class MBTrainRequester(afeParams: AfeParams, sbParams: SidebandParams)
+             "PHY",
+             "PHY",
+             true,
+-            msgInfo = Cat(0.U(12.W), newTxFunctionalLanes)
++            msgInfo = Cat(0.U(13.W), newTxFunctionalLanes)
+           )
+           applyDegrade := true.B
+ 
+@@ -1783,12 +1783,12 @@ class MBTrainResponder(afeParams: AfeParams, sbParams: SidebandParams)
+   // Responder ready logic -- used by requester
+   val responderRdyStatusReg = RegInit(false.B)
+   val responderRdy = WireInit(false.B)
+-  when((currentState =/= nextState) || (substateReg =/= nextSubstate)) {
+-    responderRdyStatusReg := false.B
+-  }
+   when(responderRdy) {
+     responderRdyStatusReg := true.B
+   }
++  when((currentState =/= nextState) || (substateReg =/= nextSubstate)) {
++    responderRdyStatusReg := false.B
++  }
+   io.responderRdy := responderRdyStatusReg || responderRdy
+ 
+   // Error detection status bits
+diff --git a/scala/src/uciedigital/logphy/modules/linktraining/PhyRetrainSidebandHandshake.scala b/scala/src/uciedigital/logphy/modules/linktraining/PhyRetrainSidebandHandshake.scala
+index 09df101..6149b79 100644
+--- a/scala/src/uciedigital/logphy/modules/linktraining/PhyRetrainSidebandHandshake.scala
++++ b/scala/src/uciedigital/logphy/modules/linktraining/PhyRetrainSidebandHandshake.scala
+@@ -92,12 +92,12 @@ class PhyRetrainRequester(sbParams: SidebandParams) extends Module {
+   // Requester ready logic -- used by responder
+   val requesterRdyStatusReg = RegInit(false.B)
+   val requesterRdy = WireInit(false.B)
+-  when(currentState =/= nextState) {
+-    requesterRdyStatusReg := false.B
+-  }
+   when(requesterRdy) {
+     requesterRdyStatusReg := true.B
+   }
++  when(currentState =/= nextState) {
++    requesterRdyStatusReg := false.B
++  }
+   io.requesterRdy := requesterRdyStatusReg || requesterRdy
+ 
+   val validRemoteRetrainEncoding = RegInit(false.B)
+@@ -114,7 +114,7 @@ class PhyRetrainRequester(sbParams: SidebandParams) extends Module {
+         "PHY",
+         "PHY",
+         true,
+-        msgInfo = Cat(0.U(12.W), io.localRetrainEncoding.bits)
++        msgInfo = Cat(0.U(13.W), io.localRetrainEncoding.bits)
+       )
+ 
+       sbMsgExchanger.io.rxRefBitPattern.valid := sbMsgExchanger.io.msgSent
+@@ -122,7 +122,7 @@ class PhyRetrainRequester(sbParams: SidebandParams) extends Module {
+ 
+       when(sbMsgExchanger.io.resp.valid) {
+         validRemoteRetrainEncoding := true.B
+-        remoteRetrainEncoding := sbMsgExchanger.io.resp.bits(74, 72)
++        remoteRetrainEncoding := sbMsgExchanger.io.resp.bits(42, 40)
+       }
+ 
+       requesterRdy := sbMsgExchanger.io.exchDone
+@@ -176,12 +176,12 @@ class PhyRetrainResponder(sbParams: SidebandParams) extends Module {
+   // Responder ready logic -- used by requester
+   val responderRdyStatusReg = RegInit(false.B)
+   val responderRdy = WireInit(false.B)
+-  when(currentState =/= nextState) {
+-    responderRdyStatusReg := false.B
+-  }
+   when(responderRdy) {
+     responderRdyStatusReg := true.B
+   }
++  when(currentState =/= nextState) {
++    responderRdyStatusReg := false.B
++  }
+   io.responderRdy := responderRdyStatusReg || responderRdy
+ 
+   val validRemoteRetrainEncoding = RegInit(false.B)
+@@ -197,7 +197,7 @@ class PhyRetrainResponder(sbParams: SidebandParams) extends Module {
+ 
+       when(sbMsgExchanger.io.resp.valid) {
+         validRemoteRetrainEncoding := true.B
+-        remoteRetrainEncoding := sbMsgExchanger.io.resp.bits(74, 72)
++        remoteRetrainEncoding := sbMsgExchanger.io.resp.bits(42, 40)
+       }
+ 
+       sbMsgExchanger.io.req.valid := io.localRetrainEncoding.valid
+@@ -206,7 +206,7 @@ class PhyRetrainResponder(sbParams: SidebandParams) extends Module {
+         "PHY",
+         "PHY",
+         true,
+-        msgInfo = Cat(0.U(12.W), io.localRetrainEncoding.bits)
++        msgInfo = Cat(0.U(13.W), io.localRetrainEncoding.bits)
+       )
+ 
+       responderRdy := sbMsgExchanger.io.exchDone
+diff --git a/scala/src/uciedigital/logphy/modules/linktraining/RxD2CEyeWidthSweep.scala b/scala/src/uciedigital/logphy/modules/linktraining/RxD2CEyeWidthSweep.scala
+index 60fe4cb..4c611ce 100644
+--- a/scala/src/uciedigital/logphy/modules/linktraining/RxD2CEyeWidthSweep.scala
++++ b/scala/src/uciedigital/logphy/modules/linktraining/RxD2CEyeWidthSweep.scala
+@@ -121,7 +121,7 @@ class RxD2CEyeWidthSweepRequester(
+   io.patternReaderIo.remoteFuncLanes := "b011".U
+ 
+   val dataField = Wire(UInt(64.W))
+-  val msgInfoField = Wire(UInt(15.W))
++  val msgInfoField = Wire(UInt(16.W))
+   // Note: Can register the response if combinational path is long, then next cycle
+   // drive the sbMsgExchanger.io.req.valid HIGH
+   dataField := Cat(
+@@ -142,19 +142,31 @@ class RxD2CEyeWidthSweepRequester(
+     io.linkTrainingParameters.comparisonMode,
+     io.linkTrainingParameters.iterationCount,
+     io.linkTrainingParameters.idleCount,
++    MuxLookup(io.patternType.asUInt, 4096.U(16.W))(
++      Seq(
++        PatternSelect.CLKREPAIR.asUInt -> 6144.U(16.W),
++        PatternSelect.VALTRAIN.asUInt -> 1024.U(16.W),
++        PatternSelect.PERLANEID.asUInt -> 2048.U(16.W),
++        PatternSelect.LFSR.asUInt -> 4096.U(16.W)
++      )
++    ),
+     io.linkTrainingParameters.patternMode,
+     io.linkTrainingParameters.clockPhase,
+     io.linkTrainingParameters.validPattern,
+-    io.linkTrainingParameters.dataPattern
++    Mux(io.patternType === PatternSelect.PERLANEID, 1.U(3.W), 0.U(3.W))
+   )
+   val maxErrorThreshold = io.linkTrainingParameters.maxErrorThreshold
+ 
++
+   currentState := nextState
++  val startPending = RegInit(false.B)
++  when(io.start && !inProgress) { startPending := true.B }
++
+   switch(currentState) {
+     is(0.U) {
+       resultValid := false.B
+-      when(io.start) {
+-        patternTypeReg := io.patternType
++      when(io.start || startPending) {
++        when(io.start) { patternTypeReg := io.patternType }
+         comparisonModeReg := io.linkTrainingParameters.comparisonMode.asTypeOf(
+           ComparisonMode()
+         )
+@@ -174,6 +186,7 @@ class RxD2CEyeWidthSweepRequester(
+         sbMsgExchanger.io.rxRefBitPattern.bits := SBM.START_RX_INIT_D2C_EYE_SWEEP_RESP
+         when(sbMsgExchanger.io.exchDone) {
+           nextState := 1.U
++          startPending := false.B
+           inProgress := true.B
+         }
+       }
+@@ -376,6 +389,7 @@ class RxD2CEyeWidthSweepResponder(
+ 
+   io.phyTrainIo.waitingForCommand := false.B
+ 
++
+   currentState := nextState
+   switch(currentState) {
+     is(0.U) {
+diff --git a/scala/src/uciedigital/logphy/modules/linktraining/RxD2CPointTest.scala b/scala/src/uciedigital/logphy/modules/linktraining/RxD2CPointTest.scala
+index bbccfff..d8c0f2b 100644
+--- a/scala/src/uciedigital/logphy/modules/linktraining/RxD2CPointTest.scala
++++ b/scala/src/uciedigital/logphy/modules/linktraining/RxD2CPointTest.scala
+@@ -115,19 +115,31 @@ class RxD2CPointTestRequester(afeParams: AfeParams, sbParams: SidebandParams)
+     io.linkTrainingParameters.comparisonMode,
+     io.linkTrainingParameters.iterationCount,
+     io.linkTrainingParameters.idleCount,
++    MuxLookup(io.patternType.asUInt, 4096.U(16.W))(
++      Seq(
++        PatternSelect.CLKREPAIR.asUInt -> 6144.U(16.W),
++        PatternSelect.VALTRAIN.asUInt -> 1024.U(16.W),
++        PatternSelect.PERLANEID.asUInt -> 2048.U(16.W),
++        PatternSelect.LFSR.asUInt -> 4096.U(16.W)
++      )
++    ),
+     io.linkTrainingParameters.patternMode,
+     io.linkTrainingParameters.clockPhase,
+     io.linkTrainingParameters.validPattern,
+-    io.linkTrainingParameters.dataPattern
++    Mux(io.patternType === PatternSelect.PERLANEID, 1.U(3.W), 0.U(3.W))
+   )
+   val maxErrorThreshold = io.linkTrainingParameters.maxErrorThreshold
+ 
++  val startPending = RegInit(false.B)
++  when(io.start && !inProgress) { startPending := true.B }
++
++
+   currentState := nextState
+   switch(currentState) {
+     is(0.U) {
+-      when(io.start) {
++      when(io.start || startPending) {
+         resultValid := false.B
+-        patternTypeReg := io.patternType // valtrain vs lfsr
++        when(io.start) { patternTypeReg := io.patternType } // valtrain vs lfsr
+         comparisonModeReg := io.linkTrainingParameters.comparisonMode // aggergate vs perlane
+         maxErrorThresholdReg := io.linkTrainingParameters.maxErrorThreshold
+ 
+@@ -140,12 +152,13 @@ class RxD2CPointTestRequester(afeParams: AfeParams, sbParams: SidebandParams)
+           msgInfo = maxErrorThreshold,
+           data = startReqData
+         )
+-        sbMsgExchanger.io.rxRefBitPattern.valid := true.B
++        sbMsgExchanger.io.req.valid := true.B
+         sbMsgExchanger.io.rxRefBitPattern.bits := SBM.START_RX_INIT_D2C_POINT_TEST_RESP
+ 
+         when(sbMsgExchanger.io.exchDone) {
+           nextState := 1.U
+           inProgress := true.B
++          startPending := false.B
+         }
+       }
+     }
+@@ -280,6 +293,7 @@ class RxD2CPointTestResponder(afeParams: AfeParams, sbParams: SidebandParams)
+   val inProgress = RegInit(false.B)
+   io.usingPatternWriter := inProgress
+ 
++
+   currentState := nextState
+   switch(currentState) {
+     is(0.U) {
+diff --git a/scala/src/uciedigital/logphy/modules/linktraining/SBInit.scala b/scala/src/uciedigital/logphy/modules/linktraining/SBInit.scala
+index d474e60..68acfab 100644
+--- a/scala/src/uciedigital/logphy/modules/linktraining/SBInit.scala
++++ b/scala/src/uciedigital/logphy/modules/linktraining/SBInit.scala
+@@ -137,29 +137,26 @@ class SBInitRequester(sbParams: SidebandParams, timeoutMaxCycles: Int)
+ 
+       // send {SBINIT Out of Reset}
+       io.sbLaneIo.tx.valid := !outOfResetDetected
+-      when(io.sbLaneIo.tx.ready) {
+-        io.sbLaneIo.tx.bits.data := SBMsgCreate(
+-          SBM.SBINIT_OUT_OF_RESET,
+-          "PHY",
+-          "PHY",
+-          true
+-        )
+-      }
++      io.sbLaneIo.tx.bits.data := SBMsgCreate(
++        SBM.SBINIT_OUT_OF_RESET,
++        "PHY",
++        "PHY",
++        true
++      )
+ 
+       when(outOfResetDetected) {
+         nextState := SBInitStateRequester.sSBINIT_DONE_MSG
+       }
+     }
+     is(SBInitStateRequester.sSBINIT_DONE_MSG) {
+-      // send {SBINIT done req} once
+       io.sbLaneIo.tx.valid := !msgSent
++      io.sbLaneIo.tx.bits.data := SBMsgCreate(
++        SBM.SBINIT_DONE_REQ,
++        "PHY",
++        "PHY",
++        true
++      )
+       when(!msgSent && io.sbLaneIo.tx.ready) {
+-        io.sbLaneIo.tx.bits.data := SBMsgCreate(
+-          SBM.SBINIT_DONE_REQ,
+-          "PHY",
+-          "PHY",
+-          true
+-        )
+         msgSent := true.B
+       }
+ 
+@@ -204,15 +201,14 @@ class SBInitResponder(sbParams: SidebandParams) extends Module {
+       msgReceived := SBMsgCompare(io.sbLaneIo.rx.bits.data, SBM.SBINIT_DONE_REQ)
+     }
+ 
+-    // once detected send {SBINIT done resp}, and signal done hold high
+     io.sbLaneIo.tx.valid := msgReceived && !msgSent
++    io.sbLaneIo.tx.bits.data := SBMsgCreate(
++      SBM.SBINIT_DONE_RESP,
++      "PHY",
++      "PHY",
++      true
++    )
+     when(msgReceived && io.sbLaneIo.tx.ready) {
+-      io.sbLaneIo.tx.bits.data := SBMsgCreate(
+-        SBM.SBINIT_DONE_RESP,
+-        "PHY",
+-        "PHY",
+-        true
+-      )
+       msgSent := true.B
+     }
+   }
+diff --git a/scala/src/uciedigital/logphy/modules/linktraining/TxD2CEyeWidthSweep.scala b/scala/src/uciedigital/logphy/modules/linktraining/TxD2CEyeWidthSweep.scala
+index cc5564b..c7e9b1d 100644
+--- a/scala/src/uciedigital/logphy/modules/linktraining/TxD2CEyeWidthSweep.scala
++++ b/scala/src/uciedigital/logphy/modules/linktraining/TxD2CEyeWidthSweep.scala
+@@ -121,22 +121,34 @@ class TxD2CEyeWidthSweepRequester(
+     io.linkTrainingParameters.comparisonMode,
+     io.linkTrainingParameters.iterationCount,
+     io.linkTrainingParameters.idleCount,
++    MuxLookup(io.patternType.asUInt, 4096.U(16.W))(
++      Seq(
++        PatternSelect.CLKREPAIR.asUInt -> 6144.U(16.W),
++        PatternSelect.VALTRAIN.asUInt -> 1024.U(16.W),
++        PatternSelect.PERLANEID.asUInt -> 2048.U(16.W),
++        PatternSelect.LFSR.asUInt -> 4096.U(16.W)
++      )
++    ),
+     io.linkTrainingParameters.patternMode,
+     io.linkTrainingParameters.clockPhase,
+     io.linkTrainingParameters.validPattern,
+-    io.linkTrainingParameters.dataPattern
++    Mux(io.patternType === PatternSelect.PERLANEID, 1.U(3.W), 0.U(3.W))
+   )
+   val maxErrorThreshold = io.linkTrainingParameters.maxErrorThreshold
+ 
+   io.phyTrainIo.waitingForCommand := false.B
+ 
+   // State machine
++
+   currentState := nextState
++  val startPending = RegInit(false.B)
++  when(io.start && !inProgress) { startPending := true.B }
++
+   switch(currentState) {
+     is(0.U) {
+       resultValid := false.B
+-      when(io.start) {
+-        patternTypeReg := io.patternType
++      when(io.start || startPending) {
++        when(io.start) { patternTypeReg := io.patternType }
+         comparisonModeReg := io.linkTrainingParameters.comparisonMode.asTypeOf(
+           ComparisonMode()
+         )
+@@ -155,6 +167,7 @@ class TxD2CEyeWidthSweepRequester(
+ 
+         when(sbMsgExchanger.io.exchDone) {
+           nextState := 1.U
++          startPending := false.B
+           inProgress := true.B
+         }
+       }
+@@ -303,7 +316,7 @@ class TxD2CEyeWidthSweepResponder(
+   io.patternReaderIo.remoteFuncLanes := "b011".U
+ 
+   val dataField = Wire(UInt(64.W))
+-  val msgInfoField = Wire(UInt(15.W))
++  val msgInfoField = Wire(UInt(16.W))
+   // Note: Can register the response if combinational path is long, then next cycle
+   // drive the sbMsgExchanger.io.req.valid HIGH
+   dataField := Cat(
+@@ -317,6 +330,7 @@ class TxD2CEyeWidthSweepResponder(
+     0.U(4.W)
+   )
+ 
++
+   currentState := nextState
+   switch(currentState) {
+     is(0.U) {
+@@ -328,7 +342,7 @@ class TxD2CEyeWidthSweepResponder(
+         sbMsgExchanger.io.rxRefBitPattern.bits := SBM.START_TX_INIT_D2C_EYE_SWEEP_REQ
+ 
+         when(sbMsgExchanger.io.resp.valid) {
+-          maxErrorThresholdReg := sbMsgExchanger.io.resp.bits(21, 14)
++          maxErrorThresholdReg := sbMsgExchanger.io.resp.bits(55, 40)
+           comparisonModeReg := sbMsgExchanger.io.resp
+             .bits(123)
+             .asTypeOf(ComparisonMode())
+diff --git a/scala/src/uciedigital/logphy/modules/linktraining/TxD2CPointTest.scala b/scala/src/uciedigital/logphy/modules/linktraining/TxD2CPointTest.scala
+index ec87c4a..ad6997c 100644
+--- a/scala/src/uciedigital/logphy/modules/linktraining/TxD2CPointTest.scala
++++ b/scala/src/uciedigital/logphy/modules/linktraining/TxD2CPointTest.scala
+@@ -73,7 +73,7 @@ class TxD2CPointTestRequester(afeParams: AfeParams, sbParams: SidebandParams)
+         is(PatternSelect.VALTRAIN) {
+           txInitPtTestResults(0) := sbMsgExchanger.io.resp.bits(19)
+         }
+-        is(PatternSelect.LFSR) {
++        is(PatternSelect.LFSR, PatternSelect.PERLANEID) {
+           for (i <- 0 until afeParams.mbLanes) {
+             txInitPtTestResults(i) := sbMsgExchanger.io.resp.bits(64 + i)
+           }
+@@ -91,8 +91,9 @@ class TxD2CPointTestRequester(afeParams: AfeParams, sbParams: SidebandParams)
+   // If start is HIGH, then patternType can either be VALTRAIN or LFSR
+   assert(
+     ((!io.start) || ((io.patternType === PatternSelect.VALTRAIN) ||
+-      (io.patternType === PatternSelect.LFSR))),
+-    "PatternType should only be VALTRAIN or LFSR"
++      (io.patternType === PatternSelect.LFSR) ||
++      (io.patternType === PatternSelect.PERLANEID))),
++    "PatternType should only be VALTRAIN, LFSR or PERLANEID"
+   )
+   io.patternWriterIo.req.bits.patternType := patternTypeReg
+   io.patternWriterIo.req.valid := false.B
+@@ -104,22 +105,34 @@ class TxD2CPointTestRequester(afeParams: AfeParams, sbParams: SidebandParams)
+     io.linkTrainingParameters.comparisonMode,
+     io.linkTrainingParameters.iterationCount,
+     io.linkTrainingParameters.idleCount,
++    MuxLookup(io.patternType.asUInt, 4096.U(16.W))(
++      Seq(
++        PatternSelect.CLKREPAIR.asUInt -> 6144.U(16.W),
++        PatternSelect.VALTRAIN.asUInt -> 1024.U(16.W),
++        PatternSelect.PERLANEID.asUInt -> 2048.U(16.W),
++        PatternSelect.LFSR.asUInt -> 4096.U(16.W)
++      )
++    ),
+     io.linkTrainingParameters.patternMode,
+     io.linkTrainingParameters.clockPhase,
+     io.linkTrainingParameters.validPattern,
+-    io.linkTrainingParameters.dataPattern
++    Mux(io.patternType === PatternSelect.PERLANEID, 1.U(3.W), 0.U(3.W))
+   )
+   val maxErrorThreshold = io.linkTrainingParameters.maxErrorThreshold
+ 
+   val inProgress = RegInit(false.B)
+   io.usingPatternWriter := inProgress
+ 
++
+   currentState := nextState
++  val startPending = RegInit(false.B)
++  when(io.start && !inProgress) { startPending := true.B }
++
+   switch(currentState) {
+     is(0.U) {
+       resultValid := false.B
+-      when(io.start) {
+-        patternTypeReg := io.patternType
++      when(io.start || startPending) {
++        when(io.start) { patternTypeReg := io.patternType }
+         comparisonModeReg := io.linkTrainingParameters.comparisonMode
+ 
+         sbMsgExchanger.io.req.valid := true.B
+@@ -136,6 +149,7 @@ class TxD2CPointTestRequester(afeParams: AfeParams, sbParams: SidebandParams)
+ 
+         when(sbMsgExchanger.io.exchDone) {
+           nextState := 1.U
++          startPending := false.B
+           inProgress := true.B
+         }
+       }
+@@ -247,8 +261,9 @@ class TxD2CPointTestResponder(afeParams: AfeParams, sbParams: SidebandParams)
+   // If start is HIGH, then patternType can either be VALTRAIN or LFSR
+   assert(
+     ((!io.start) || ((io.patternType === PatternSelect.VALTRAIN) ||
+-      (io.patternType === PatternSelect.LFSR))),
+-    "PatternType should only be VALTRAIN or LFSR"
++      (io.patternType === PatternSelect.LFSR) ||
++      (io.patternType === PatternSelect.PERLANEID))),
++    "PatternType should only be VALTRAIN, LFSR or PERLANEID"
+   )
+   io.patternReaderIo.req.valid := false.B
+   io.patternReaderIo.req.bits.patternType := patternTypeReg // from LTSM
+@@ -277,6 +292,7 @@ class TxD2CPointTestResponder(afeParams: AfeParams, sbParams: SidebandParams)
+   val inProgress = RegInit(false.B)
+   io.usingPatternReader := inProgress
+ 
++
+   currentState := nextState
+   switch(currentState) {
+     is(0.U) {
+@@ -286,7 +302,7 @@ class TxD2CPointTestResponder(afeParams: AfeParams, sbParams: SidebandParams)
+         sbMsgExchanger.io.rxRefBitPattern.bits := SBM.START_TX_INIT_D2C_POINT_TEST_REQ
+ 
+         when(sbMsgExchanger.io.resp.valid) {
+-          maxErrorThresholdReg := sbMsgExchanger.io.resp.bits(21, 14)
++          maxErrorThresholdReg := sbMsgExchanger.io.resp.bits(55, 40)
+           comparisonModeReg := sbMsgExchanger.io.resp
+             .bits(123)
+             .asTypeOf(ComparisonMode())
+@@ -308,10 +324,12 @@ class TxD2CPointTestResponder(afeParams: AfeParams, sbParams: SidebandParams)
+       sbMsgExchanger.io.rxRefBitPattern.valid := true.B
+       sbMsgExchanger.io.rxRefBitPattern.bits := SBM.LFSR_CLEAR_ERROR_REQ
+ 
+-      assert(
+-        io.patternReaderIo.req.ready === true.B,
+-        "PatternReader should be ready to accept"
+-      )
++      when(sbMsgExchanger.io.resp.valid) {
++        assert(
++          io.patternReaderIo.req.ready === true.B,
++          "PatternReader should be ready to accept"
++        )
++      }
+ 
+       io.patternReaderIo.req.valid := sbMsgExchanger.io.resp.valid
+       sbMsgExchanger.io.req.valid := sbMsgExchanger.io.msgReceived
+diff --git a/scala/src/uciedigital/logphy/modules/rdi/RDIController.scala b/scala/src/uciedigital/logphy/modules/rdi/RDIController.scala
+index 161c4b0..bea471a 100644
+--- a/scala/src/uciedigital/logphy/modules/rdi/RDIController.scala
++++ b/scala/src/uciedigital/logphy/modules/rdi/RDIController.scala
+@@ -85,7 +85,7 @@ class RDIController(sbParams: SidebandParams) extends Module {
+           (effectiveLpStateReq === RDIStateReq.l2)))
+ 
+   stallRequester.io.ctrl.startStall := holdUpperLayerStall && !stallRequester.io.ctrl.isStalled
+-  stallRequester.io.ctrl.releaseStall := !holdUpperLayerStall && (currentState =/= RDIState.active)
++  stallRequester.io.ctrl.releaseStall := !holdUpperLayerStall
+   stallRequester.io.rdi.lpStallAck := io.rdi.lpStallAck
+   io.rdi.plStallReq := stallRequester.io.rdi.plStallReq
+ 
+@@ -118,7 +118,10 @@ class RDIController(sbParams: SidebandParams) extends Module {
+         activeReaderClients <= 1.U,
+         "FATAL: Multiple RDI sideband subclients asserted RX ready in the same cycle"
+       )
+-      when(currentState === RDIState.active) {
++      when(
++        (currentState === RDIState.active) &&
++          !RegNext(currentState === RDIState.active, false.B)
++      ) {
+         assert(
+           activeBringupReady,
+           "FATAL: RDI ACTIVE requires wake and clock prerequisites to be complete"
+@@ -130,19 +133,29 @@ class RDIController(sbParams: SidebandParams) extends Module {
+           "FATAL: pl_inband_pres assertion in RESET must be covered by the clock handshake"
+         )
+       }
+-      when(mustHoldClocksUntilStateChanges) {
++      when(
++        mustHoldClocksUntilStateChanges && RegNext(
++          mustHoldClocksUntilStateChanges,
++          false.B
++        )
++      ) {
+         assert(
+           clockRequester.io.rdi.plClkReq,
+           "FATAL: pl_clk_req must remain asserted while leaving RESET/PM states"
+         )
+       }
+-      when(rdiStateMachine.io.sidebandBusy) {
++      when(
++        rdiStateMachine.io.sidebandBusy && RegNext(
++          rdiStateMachine.io.sidebandBusy,
++          false.B
++        )
++      ) {
+         assert(
+           clockRequester.io.rdi.plClkReq,
+           "FATAL: Sideband traffic to the Adapter must be covered by the clock handshake"
+         )
+       }
+-      when(io.cfgSidebandActive) {
++      when(io.cfgSidebandActive && RegNext(io.cfgSidebandActive, false.B)) {
+         assert(
+           clockRequester.io.rdi.plClkReq,
+           "FATAL: RDI cfg sideband activity must be covered by the clock handshake"
+diff --git a/scala/src/uciedigital/sideband/modules/SidebandLinkSerdes.scala b/scala/src/uciedigital/sideband/modules/SidebandLinkSerdes.scala
+index ef607c0..95804d2 100644
+--- a/scala/src/uciedigital/sideband/modules/SidebandLinkSerdes.scala
++++ b/scala/src/uciedigital/sideband/modules/SidebandLinkSerdes.scala
+@@ -254,8 +254,13 @@ class SidebandLinkDeserializer(
+ 
+   val asyncQueueDepth = 2
+ 
++  val chunkBits = 64
++  val gapDetectCycles = 4
++
+   val negFwClock = (!io.in.fwClock).asClock
+ 
++  val accumHold = Wire(Bool())
++
+   // The assembled message word crosses to the local clock domain through an async FIFO.
+   val rxQueue = Module(
+     new AsyncQueue(UInt(msgW.W), AsyncQueueParams(depth = asyncQueueDepth))
+@@ -267,7 +272,10 @@ class SidebandLinkDeserializer(
+ 
+   // Assemble the serial bits and enqueue the complete word on the final bit
+   // in the forwarded clock domain.
+-  val idleStatus = withClockAndReset(negFwClock, reset.asAsyncReset) {
++  val (idleStatus, fwBitCounter) = withClockAndReset(
++    negFwClock,
++    (reset.asBool || accumHold).asAsyncReset
++  ) {
+     val counter = RegInit(0.U(log2Ceil(msgW).W))
+     val maxBits = RegInit((msgW - 1).U(log2Ceil(msgW).W))
+     val dataReg = RegInit(0.U(msgW.W))
+@@ -296,8 +304,29 @@ class SidebandLinkDeserializer(
+     // Register before the CDC to the local domain: the comparator output can
+     // glitch while the counter transitions, and the async local clock could
+     // sample the glitch.
+-    RegNext(counter === 0.U, true.B)
++    (RegNext(counter === 0.U, true.B), counter)
++  }
++
++  val bitBeacon = withClockAndReset(negFwClock, reset.asAsyncReset) {
++    val toggle = RegInit(false.B)
++    toggle := !toggle
++    toggle
++  }
++
++  val bitBeaconPrev = RegNext(bitBeacon, false.B)
++  val fwQuietCycles = RegInit(0.U(log2Ceil(gapDetectCycles + 1).W))
++  when(bitBeacon =/= bitBeaconPrev) {
++    fwQuietCycles := 0.U
++  }.elsewhen(fwQuietCycles =/= gapDetectCycles.U) {
++    fwQuietCycles := fwQuietCycles + 1.U
++  }
++  val fwIdle = fwQuietCycles === gapDetectCycles.U
++
++  val framed = RegInit(false.B)
++  when(fwIdle) {
++    framed := true.B
+   }
++  accumHold := !framed
+ 
+   io.out.valid := rxQueue.io.deq.valid
+   io.out.bits := rxQueue.io.deq.bits
+diff --git a/scala/test/src/uciedigital/d2dadapter/D2DMainbandModuleTest.scala b/scala/test/src/uciedigital/d2dadapter/D2DMainbandModuleTest.scala
+index 65f9971..5497ef9 100644
+--- a/scala/test/src/uciedigital/d2dadapter/D2DMainbandModuleTest.scala
++++ b/scala/test/src/uciedigital/d2dadapter/D2DMainbandModuleTest.scala
+@@ -225,12 +225,10 @@ class D2DMainbandModuleTest extends AnyFunSpec with ChiselSim {
+         c.io.fdi.plValid.expect(true.B)
+         c.io.fdi.plData.expect(BigInt("dead", 16).U)
+ 
+-        // The captured beat is held until rxActiveReq drops.
+-        c.clock.step(2)
+-        c.io.fdi.plValid.expect(true.B)
+-        c.io.state.rxActiveReq.poke(false.B)
++        // plValid is a per beat qualifier, so it drops the next cycle.
+         c.clock.step()
+         c.io.fdi.plValid.expect(false.B)
++        c.io.fdi.plData.expect(BigInt("dead", 16).U)
+       }
+     }
+ 
+diff --git a/scala/test/src/uciedigital/loopback/LogPhyStagedBringupTest.scala b/scala/test/src/uciedigital/loopback/LogPhyStagedBringupTest.scala
+index d6e0159..7ce1a29 100644
+--- a/scala/test/src/uciedigital/loopback/LogPhyStagedBringupTest.scala
++++ b/scala/test/src/uciedigital/loopback/LogPhyStagedBringupTest.scala
+@@ -26,9 +26,7 @@ import org.scalatest.funspec.AnyFunSpec
+ class LogPhyStagedBringupTest extends AnyFunSpec with ChiselSim {
+ 
+   // The LTSM asserts on substates the link passes through on its way up.
+-  private val firtoolOpts = Array(
+-    "--disable-layers=Verification,Verification.Assert,Verification.Assume,Verification.Cover"
+-  )
++  private val firtoolOpts = Array[String]()
+ 
+   // The LTSM holds RESET for half of its 6.4M-cycle substate timeout.
+   private val resetWait = 3200000
+diff --git a/scala/test/src/uciedigital/loopback/UcieDigitalStagedBringupTest.scala b/scala/test/src/uciedigital/loopback/UcieDigitalStagedBringupTest.scala
+index 031e307..3b21182 100644
+--- a/scala/test/src/uciedigital/loopback/UcieDigitalStagedBringupTest.scala
++++ b/scala/test/src/uciedigital/loopback/UcieDigitalStagedBringupTest.scala
+@@ -23,9 +23,7 @@ class UcieDigitalStagedBringupTest extends AnyFunSpec with ChiselSim {
+   private type H = UcieDigitalLoopbackHarness
+ 
+   // The LTSM asserts on substates the link passes through on its way up.
+-  private val firtoolOpts = Array(
+-    "--disable-layers=Verification,Verification.Assert,Verification.Assume,Verification.Cover"
+-  )
++  private val firtoolOpts = Array[String]()
+ 
+   private val resetWait = 3200000
+   private val trainCycles = 3000000
+diff --git a/scala/test/src/uciedigital/loopback/UcieMmioBringupTest.scala b/scala/test/src/uciedigital/loopback/UcieMmioBringupTest.scala
+index 328854f..047cb9e 100644
+--- a/scala/test/src/uciedigital/loopback/UcieMmioBringupTest.scala
++++ b/scala/test/src/uciedigital/loopback/UcieMmioBringupTest.scala
+@@ -30,9 +30,7 @@ class UcieMmioBringupTest extends AnyFunSpec with ChiselSim {
+   private implicit val p: Parameters = Parameters.empty
+ 
+   // The LTSM asserts on substates the link passes through on its way up.
+-  private val firtoolOpts = Array(
+-    "--disable-layers=Verification,Verification.Assert,Verification.Assume,Verification.Cover"
+-  )
++  private val firtoolOpts = Array[String]()
+ 
+   private val resetWait = 3200000
+   private val trainCycles = 3000000

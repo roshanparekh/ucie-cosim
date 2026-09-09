@@ -1,0 +1,16 @@
+# Fallback toolchain, used only when site.sh leaves SITE_CXX empty.
+#
+# syscan accepts g++ 9.2.0, 9.5.0, 12.3.0 or 13.2.0 with SystemC 2.3.4. BWRC
+# machines carry 10.3, 11.5 and 14.2, none of them accepted.
+#
+# numactl is libnuma, which the VCS link line needs. libboost-headers is for
+# matchlib's nvhls_array.h; Catapult ships only the boost preprocessor subset.
+name: ucie-cosim
+channels:
+  - conda-forge
+dependencies:
+  - gxx_linux-64=13.2.0
+  - gcc_linux-64=13.2.0
+  - numactl
+  - libboost-headers
+  - make

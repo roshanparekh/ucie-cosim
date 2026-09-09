@@ -1,0 +1,6 @@
+[submodule "dut/ucie"]
+	path = dut/ucie
+	url = https://github.com/ucb-bar/ucie.git
+[submodule "dut/madsim"]
+	path = dut/madsim
+	url = https://code.stanford.edu/tambe-lab/madsim.git
