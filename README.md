@@ -8,7 +8,8 @@ other:
 UcieTL is die B and wakes on the sideband pattern its partner sends; madsim is
 die A and self-starts out of reset. Both run from one clock, since UcieTL
 clocks its sideband and mainband together and madsim has no fixed frequency
-ratios.
+ratios. Sideband data and forwarded clocks now connect directly between
+the dies, without the sideband shim.
 
 Once the link is up, both dies push flits across it and a monitor checks them
 at RDI and at the protocol-layer boundary.
@@ -57,11 +58,11 @@ on the command line:
 
     make run CYCLES=30000            short run
     make run VERBOSE=1               signal-level tracing in the log
-    make run TX_BEATS=10000          more TileLink traffic
+    make run UCIE_TX_MSGS=10000      more TileLink traffic
     make run CREDIT_FLOW=1           leave TileLink credit flow on
 
-`CLK_PERIOD_PS` and the `MADSIM_TX_*` parameters reach both the SystemC wrapper
-and the Verilog from that one file, so the two sides cannot disagree.
+`UCIE_TX_MSGS` and `MADSIM_TX_MSGS` reach both the SystemC wrapper and the
+Verilog from that one file. `CLK_PERIOD_PS` sets their shared clock.
 
 ## Notes
 

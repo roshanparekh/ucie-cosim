@@ -77,10 +77,8 @@ bind ucie_cosim_top cosim_monitor u_mon (
   .ucie_rdi_rx_data    (u_ucie._ucieDigitalLazy_logicalPhy_io_rdi_plData),
 
   // The bumps themselves, to separate nothing sent from sent and misread.
-  .a2b_sb_val      (a2b_sb_val),
+  .a2b_sb_clk      (a2b_sb_clk),
   .a2b_sb_data     (a2b_sb_data),
-  .ucie_sb_rx_clk    (ucie_sb_rx_clk),
-  .ucie_sb_rx_data_i (ucie_sb_rx_data),
 
   // Stages 2 to 4 walk the receive path inward, so a failure points at one
   // stage. The bit assembler in the recovered clock domain, then after the
@@ -94,7 +92,7 @@ bind ucie_cosim_top cosim_monitor u_mon (
 
   .des_out_valid (u_ucie.ucieDigitalLazy_logicalPhy.logPhySidebandChannel.linkNode.io_rxOut_valid),
   .des_out_word  (u_ucie.ucieDigitalLazy_logicalPhy.logPhySidebandChannel.linkNode.io_rxOut_bits[63:0]),
-  .b2a_sb_val      (b2a_sb_val),
+  .b2a_sb_clk      (b2a_sb_clk),
   .b2a_sb_data     (b2a_sb_data),
 
   // UcieTL's SBINIT sub-FSM, since the outer ltState only reports "SBINIT":

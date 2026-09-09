@@ -802,56 +802,6 @@ index 981c1e5..e581421 100644
  
    io.phyTrainIo.eyeSweepCtrl.step := false.B
    io.phyTrainIo.eyeSweepCtrl.doneStepping := false.B
-diff --git a/scala/src/uciedigital/logphy/modules/SidebandMessageExchanger.scala b/scala/src/uciedigital/logphy/modules/SidebandMessageExchanger.scala
-index aa67465..62204c9 100644
---- a/scala/src/uciedigital/logphy/modules/SidebandMessageExchanger.scala
-+++ b/scala/src/uciedigital/logphy/modules/SidebandMessageExchanger.scala
-@@ -30,6 +30,8 @@ class SidebandMessageExchanger(sbParams: SidebandParams) extends Module {
-   val msgSent = RegInit(false.B)
-   val msgReceived = RegInit(false.B)
- 
-+  val answered = RegInit(false.B)
-+
-   io.resp.bits := io.sbLaneIo.rx.bits.data
-   io.resp.valid := false.B
- 
-@@ -52,11 +54,36 @@ class SidebandMessageExchanger(sbParams: SidebandParams) extends Module {
-     // combinationally, and within the cycle resp valid goes high
-     // Note: This might cause sbLaneIo.rx.bits.data to be a long path
-     io.resp.valid := true.B
-+
-+    when(msgSent || (io.sbLaneIo.tx.valid && io.sbLaneIo.tx.ready)) {
-+      answered := true.B
-+    }
-+  }
-+
-+  val retryWindow = 4096
-+  val retryCounter = RegInit(0.U(log2Ceil(retryWindow + 1).W))
-+  val retryNow = retryCounter === retryWindow.U
-+
-+  val retryPending = msgSent && !answered
-+
-+  when(retryPending) {
-+    when(!retryNow) {
-+      retryCounter := retryCounter + 1.U
-+    }
-+  }.otherwise {
-+    retryCounter := 0.U
-+  }
-+
-+  when(retryNow) {
-+    msgSent := false.B
-+    retryCounter := 0.U
-   }
- 
-   when(io.clear) {
-     msgSent := false.B
-     msgReceived := false.B
-+    answered := false.B
-+    retryCounter := 0.U
-   }
- 
-   // This module can be used to send or receive a single message by driving io.req.valid
 diff --git a/scala/src/uciedigital/logphy/modules/linktraining/LinkTrainingSM.scala b/scala/src/uciedigital/logphy/modules/linktraining/LinkTrainingSM.scala
 index 1d7adb9..9c4856f 100644
 --- a/scala/src/uciedigital/logphy/modules/linktraining/LinkTrainingSM.scala

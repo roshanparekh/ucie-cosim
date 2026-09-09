@@ -74,10 +74,8 @@ module cosim_monitor (
     input wire [511:0] ucie_rdi_rx_data,
 
     // bump activity
-    input wire        a2b_sb_val,
+    input wire        a2b_sb_clk,
     input wire        a2b_sb_data,
-    input wire        ucie_sb_rx_clk,
-    input wire        ucie_sb_rx_data_i,
 
     // Deserializer bit assembler, in the recovered forwarded clock domain.
     input wire [6:0]  des_bit_cnt,
@@ -91,7 +89,7 @@ module cosim_monitor (
     // Link node output, after the parity check and the opcode priority queue.
     input wire        des_out_valid,
     input wire [63:0] des_out_word,
-    input wire        b2a_sb_val,
+    input wire        b2a_sb_clk,
     input wire        b2a_sb_data,
 
     // Mainband. First needed at MBINIT.REPAIRCLK.
@@ -102,7 +100,7 @@ module cosim_monitor (
     input wire        mad_mb_rx_enable,
     input wire        mad_mb_tx_enable,
     input wire [1:0]  mad_mb_pattern_select,
-    // madsim's sideband transmit arbitration. DriveTx grants ready by strict
+    // madsim's sideband transmit arbitration. DriveReady grants ready by strict
     // priority (RDI, LTSM, CFG), so a persistent rdi_tx_valid starves the LTSM.
     input wire [63:0] mad_sb_ltsm_tx_msg,
     input wire        mad_sb_ltsm_tx_valid,
@@ -265,7 +263,6 @@ module cosim_monitor (
   longint unsigned n_ucie_sb_words = 0;  // 64-bit words UcieTL's deser accepted
   longint unsigned n_ucie_sb_match = 0;  // of those, ones equal to the pattern
   longint unsigned n_b2a_sb_bits  = 0;   // UcieTL sideband bits coming back
-  longint unsigned n_ucie_sbclk_edges = 0;
   longint unsigned n_des_words = 0;
   longint unsigned n_des_match = 0;
   longint unsigned n_enq_offer = 0;   // words the assembler completed
@@ -274,7 +271,7 @@ module cosim_monitor (
   longint unsigned n_raw_match = 0;
 
   // What UcieTL sends back, assembled as madsim's receiver frames it.
-  // one sample per cycle in which the recovered valid is high, LSB first.
+  // one sample per falling edge of the forwarded clock, LSB first.
   // Knowing madsim times out is not the same as knowing what it was sent.
   logic [63:0] b2a_word = 64'b0;
   int unsigned b2a_bit_idx = 0;
@@ -352,24 +349,12 @@ module cosim_monitor (
   longint unsigned n_stxq_v = 0, n_lyr_v = 0, n_lyr_r = 0;
   logic reported_x = 1'b0;
 
-  // Burst accounting. UcieTL's deserializer never re-syncs on the gap between
-  // bursts, so any burst that is not exactly the packet length shifts every
-  // later word permanently.
-  int unsigned burst_len = 0;
-  longint unsigned n_bursts = 0;
-  logic p_a2b_val = 1'b0;
   longint unsigned n_reframe = 0;
   logic p_reframe = 1'b0;
   longint unsigned n_des_reset = 0;
   longint unsigned n_des_fwclk = 0;
   logic p_des_fwclk = 1'b0;
   logic reported_xsrc = 1'b0;
-
-  // What madsim puts on the wire, LSB first, one sample per valid cycle. Reads
-  // 0x5555555555555555 if the pattern is good and the corruption is in transit.
-  logic [63:0] mad_word = 64'b0;
-  int unsigned mad_bit_idx = 0;
-  logic        mad_word_logged = 1'b0;
 
   function automatic string ltstate_name(input logic [3:0] s);
     case (s)
@@ -657,28 +642,6 @@ module cosim_monitor (
     end else begin
       cyc <= cyc + 1;
 
-      // --- bump activity ---------------------------------------------------
-      if (a2b_sb_val)     n_a2b_sb_bits      <= n_a2b_sb_bits + 1;
-      if (b2a_sb_val)     n_b2a_sb_bits      <= n_b2a_sb_bits + 1;
-      if (ucie_sb_rx_clk) n_ucie_sbclk_edges <= n_ucie_sbclk_edges + 1;
-
-      if (n_a2b_sb_bits == 0 && a2b_sb_val)
-        ev("madsim began transmitting on the sideband");
-
-      // --- what madsim itself transmits, assembled the same way ------------
-      if (a2b_sb_val && !mad_word_logged) begin
-        mad_word[mad_bit_idx] <= a2b_sb_data;
-        if (mad_bit_idx == 63) begin
-          mad_word_logged <= 1'b1;
-          mad_bit_idx     <= 0;
-        end else begin
-          mad_bit_idx <= mad_bit_idx + 1;
-        end
-      end
-      if (mad_bit_idx == 63 && a2b_sb_val && !mad_word_logged)
-        evv($sformatf("madsim TX first 64 sideband bits = 0x%016h (expect 5555555555555555)",
-                     {a2b_sb_data, mad_word[62:0]}));
-
       // --- stage 2: the bit assembler in the forwarded clock domain ---------
       // Sampled from the local clock. Both dies share one clock, so an offer
       // shorter than a period cannot occur.
@@ -739,26 +702,6 @@ module cosim_monitor (
         evv($sformatf("deserializer reframe asserted, bit counter = %0d, maxBits = %0d, quiet = %0d",
                      des_bit_cnt, des_max_bits, des_quiet));
       p_reframe <= des_reframe;
-
-      // --- madsim burst structure -------------------------------------------
-      if (a2b_sb_val) begin
-        burst_len <= burst_len + 1;
-        // Bursts before sbReset releases are uninformative, because the deserializer is
-        // held in reset so its counter reads 0 regardless. The interesting
-        // window is the handful of bursts either side of the release.
-        if (!p_a2b_val && n_bursts >= 46 && n_bursts < 78)
-          evv($sformatf("madsim burst %0d starts, deserializer bit counter = %0d, maxBits = %0d, rxMode = %0d%s",
-                       n_bursts, des_bit_cnt, des_max_bits, des_rxmode,
-                       ((des_bit_cnt & 6'h3F) == 0) ? "" : "   <-- MISFRAMED, not on a 64-bit chunk boundary"));
-      end else if (p_a2b_val) begin
-        n_bursts <= n_bursts + 1;
-        if (n_bursts >= 46 && n_bursts < 78)
-          evv($sformatf("madsim burst %0d ended, length %0d bits%s",
-                       n_bursts, burst_len,
-                       (burst_len == 64) ? "" : "   <-- NOT 64"));
-        burst_len <= 0;
-      end
-      p_a2b_val <= a2b_sb_val;
 
       // --- transmit handshake chain -----------------------------------------
       if (req_tx_valid) n_req_v <= n_req_v + 1;
@@ -821,34 +764,6 @@ module cosim_monitor (
                      stxa_out_data, stxa_out_valid,
                      rdic_tx_data, rdic_tx_valid,
                      lt_tx_data, lt_tx_valid));
-      end
-
-      // --- what UcieTL sends back -------------------------------------------
-      if (b2a_sb_val) begin
-        if (b2a_bit_idx == 63) begin
-          b2a_bit_idx <= 0;
-          n_b2a_words <= n_b2a_words + 1;
-          // Consecutive repeats are counted, not printed, because the exchanger
-          // re-sends an unanswered message every few thousand cycles, and
-          // printing each one buries the exchange in duplicates.
-          if ({b2a_sb_data, b2a_word[62:0]} !== last_tx_word) begin
-            last_tx_word <= {b2a_sb_data, b2a_word[62:0]};
-            last_tx_cyc  <= cyc;
-            last_tx_ltsm <= mad_ltsm;
-            n_tx_repeat  <= 0;
-            n_b2a_distinct <= n_b2a_distinct + 1;
-            ev(sb_line("ucie  -> madsim :", mad_ltsm,
-                       {b2a_sb_data, b2a_word[62:0]}));
-          end else begin
-            n_tx_repeat <= n_tx_repeat + 1;
-            last_tx_cyc <= cyc;
-            if (n_tx_repeat == 0)
-              ev($sformatf("ucie  -> madsim :   (re-sending the above; further repeats counted, not logged)"));
-          end
-        end else begin
-          b2a_word[b2a_bit_idx] <= b2a_sb_data;
-          b2a_bit_idx <= b2a_bit_idx + 1;
-        end
       end
 
       // --- mainband activity ------------------------------------------------
@@ -1208,26 +1123,59 @@ module cosim_monitor (
   // ---------------------------------------------------------------------
   // Stage 1 measured the same way stage 2 measures it
   // ---------------------------------------------------------------------
-  // Assembles the shim's output by the deserializer's own rule, so the two can
+  // Assembles madsim's output by the deserializer's own rule, so the two can
   // be compared to locate a rotation.
   logic [63:0] eye_word = 64'b0;
   int unsigned eye_idx = 0;
   int unsigned eye_words = 0;
 
-  always @(negedge ucie_sb_rx_clk) begin
+  always @(negedge a2b_sb_clk) begin
     if (rst_n) begin
+      n_a2b_sb_bits <= n_a2b_sb_bits + 1;
+      if (n_a2b_sb_bits == 0)
+        ev("madsim began transmitting on the sideband");
       if (eye_idx == 63) begin
         if (eye_words < 4)
           if (VERBOSE) begin
-            $fdisplay(fh, "[%12d] shim output as the deserializer would frame it = 0x%016h",
-                      cyc, {ucie_sb_rx_data_i, eye_word[62:0]});
+            $fdisplay(fh, "[%12d] madsim output as the deserializer would frame it = 0x%016h",
+                      cyc, {a2b_sb_data, eye_word[62:0]});
             $fflush(fh);
           end
         eye_words <= eye_words + 1;
         eye_idx   <= 0;
       end else begin
-        eye_word[eye_idx] <= ucie_sb_rx_data_i;
+        eye_word[eye_idx] <= a2b_sb_data;
         eye_idx <= eye_idx + 1;
+      end
+    end
+  end
+
+  // --- what UcieTL sends back -------------------------------------------
+  always @(negedge b2a_sb_clk) begin
+    if (rst_n) begin
+      n_b2a_sb_bits <= n_b2a_sb_bits + 1;
+      if (b2a_bit_idx == 63) begin
+        b2a_bit_idx <= 0;
+        n_b2a_words <= n_b2a_words + 1;
+        // Consecutive repeats are counted, not printed, because printing each
+        // one buries the exchange in duplicates.
+        if ({b2a_sb_data, b2a_word[62:0]} !== last_tx_word) begin
+          last_tx_word <= {b2a_sb_data, b2a_word[62:0]};
+          last_tx_cyc  <= cyc;
+          last_tx_ltsm <= mad_ltsm;
+          n_tx_repeat  <= 0;
+          n_b2a_distinct <= n_b2a_distinct + 1;
+          ev(sb_line("ucie  -> madsim :", mad_ltsm,
+                     {b2a_sb_data, b2a_word[62:0]}));
+        end else begin
+          n_tx_repeat <= n_tx_repeat + 1;
+          last_tx_cyc <= cyc;
+          if (n_tx_repeat == 0)
+            ev($sformatf("ucie  -> madsim :   (re-sending the above; further repeats counted, not logged)"));
+        end
+      end else begin
+        b2a_word[b2a_bit_idx] <= b2a_sb_data;
+        b2a_bit_idx <= b2a_bit_idx + 1;
       end
     end
   end
@@ -1236,9 +1184,7 @@ module cosim_monitor (
   // madsim's sideband transmit path
   // ---------------------------------------------------------------------
   logic       p_ltsm_starved  = 1'b0;
-  // Offers versus acknowledged handoffs. sent_req_/sent_resp_ are set when
-  // SendMsg is called, not on handoff, so a message the sideband does not take
-  // is never re-offered and the LTSM still believes it went out.
+  // Offers versus acknowledged handoffs.
   logic [63:0] p_ltsm_msg = 64'h0;
   int unsigned n_ltsm_lost = 0;
   int unsigned n_ltsm_offers = 0;
@@ -1248,7 +1194,7 @@ module cosim_monitor (
   always @(posedge clk) if (rst_n) begin
 
     if (mad_sb_ltsm_tx_valid && p_ltsm_offer &&
-        (mad_sb_ltsm_tx_msg !== p_ltsm_msg) && !mad_sb_ltsm_tx_ready) begin
+        (mad_sb_ltsm_tx_msg !== p_ltsm_msg) && p_ltsm_starved) begin
       n_ltsm_lost <= n_ltsm_lost + 1;
       $fdisplay(fh, "[%12d] mad.sideband MESSAGE LOST: 0x%016h overwritten by 0x%016h before handoff (%s -> %s)",
                 cyc, p_ltsm_msg, mad_sb_ltsm_tx_msg,
@@ -1404,8 +1350,7 @@ module cosim_monitor (
   // Stall detection, to stop as soon as nothing is advancing
   // ---------------------------------------------------------------------
   // Finishes early once every progress signal has been still for a while.
-  // Retry traffic does not count, since the exchanger re-sends forever while the link
-  // sits in one substate. Disable with +stall_cycles=0.
+  // Disable with +stall_cycles=0.
   int unsigned stall_limit = 300000;
 
   wire [127:0] progress_sig = {
@@ -1572,7 +1517,6 @@ module cosim_monitor (
   // same thing on both dies. Above FDI the stacks diverge, with UcieTL framing
   // TileLink, madsim frames AXI.
   // ---------------------------------------------------------------------
-  int unsigned n_mad2ucie_ok = 0, n_mad2ucie_bad = 0;
 
   // ucie -> madsim has no per-flit counter, so it is checked as a stream, in
   // order and bit exact. Recorded on the FDI transfer (lpValid && plTrdy),

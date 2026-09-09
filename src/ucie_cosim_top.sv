@@ -60,9 +60,6 @@ module ucie_cosim_top;
   int unsigned run_cycles = 8_000_000;
 
   // Starts high so every posedge lands on a whole multiple of the period.
-  // matchlib requires that of its reference sc_clock, so the Verilog side is
-  // the one that has to line up. Half a period of skew shows up as
-  // CONNECTIONS-113, not as anything clock-shaped.
   logic clk = 1'b1;
   always #CLK_HALF_PERIOD clk = ~clk;
 
@@ -102,12 +99,10 @@ module ucie_cosim_top;
   wire [15:0] b2a_mb_data;
   wire        b2a_mb_vld, b2a_mb_ckp, b2a_mb_ckn, b2a_mb_trk;
 
-  // Sideband as each side wants to see it. The two are not interchangeable,
-  // since madsim carries a level valid and UcieTL a gated forwarded clock.
-  wire a2b_sb_data, a2b_sb_val;      // madsim drives
-  wire b2a_sb_data, b2a_sb_val;      // shim drives, madsim samples
-  wire ucie_sb_rx_data, ucie_sb_rx_clk;   // shim drives, UcieTL samples
-  wire ucie_sb_tx_data, ucie_sb_tx_clk;   // UcieTL drives
+  // Both dies use sideband data plus a gated forwarded clock. Cross the
+  // pairs directly; each receiver samples on its incoming clock falling edge.
+  wire a2b_sb_data, a2b_sb_clk;      // madsim drives, UcieTL samples
+  wire b2a_sb_data, b2a_sb_clk;      // UcieTL drives, madsim samples
 
   // ---------------------------------------------------------------------
   // Observation nets. Not required for the connection, only so the buses
@@ -162,7 +157,7 @@ module ucie_cosim_top;
   // Report an x on any pin feeding madsim instead, so the squash is not silent.
   always @(posedge clk) if (rst_n) begin
     if ($isunknown({b2a_mb_data, b2a_mb_vld, b2a_mb_ckp, b2a_mb_ckn,
-                    b2a_mb_trk, b2a_sb_data, b2a_sb_val}))
+                    b2a_mb_trk, b2a_sb_data, b2a_sb_clk}))
       $display("[%t] cosim: X on a madsim input pin, squashed to 0", $time);
   end
 
@@ -197,9 +192,9 @@ module ucie_cosim_top;
     .mb_rx_trk (b2a_mb_trk),
 
     .sb_tx_data (a2b_sb_data),
-    .sb_tx_val  (a2b_sb_val),
+    .sb_tx_clk  (a2b_sb_clk),
     .sb_rx_data (b2a_sb_data),
-    .sb_rx_val  (b2a_sb_val),
+    .sb_rx_clk  (b2a_sb_clk),
 
     .obs_rdi_lp_valid(mad_rdi_lp_valid),
     .obs_rdi_pl_valid(mad_rdi_pl_valid),
@@ -231,24 +226,6 @@ module ucie_cosim_top;
     .obs_mb_rx_chunk_valid (mad_mb_rx_chunk_valid),
     .obs_mb_rx_chunk_ckn   (mad_mb_rx_chunk_ckn),
     .obs_mb_rx_chunk_vld   (mad_mb_rx_chunk_vld)
-  );
-
-  // ---------------------------------------------------------------------
-  // Sideband shim. The only place the two conventions are reconciled.
-  // ---------------------------------------------------------------------
-  ucie_sb_shim #(.RX_ALIGN(0)) u_sb_shim (
-    .sb_clk (clk),
-    .rst_n  (rst_n),
-
-    .mad_sb_tx_data (a2b_sb_data),
-    .mad_sb_tx_val  (a2b_sb_val),
-    .mad_sb_rx_data (b2a_sb_data),
-    .mad_sb_rx_val  (b2a_sb_val),
-
-    .ucie_sb_rx_data (ucie_sb_rx_data),
-    .ucie_sb_rx_clk  (ucie_sb_rx_clk),
-    .ucie_sb_tx_data (ucie_sb_tx_data),
-    .ucie_sb_tx_clk  (ucie_sb_tx_clk)
   );
 
   // ---------------------------------------------------------------------
@@ -300,11 +277,11 @@ module ucie_cosim_top;
     .io_phy_txClkP  (b2a_mb_ckp),
     .io_phy_txClkN  (b2a_mb_ckn),
 
-    // Sideband, through the shim
-    .io_phy_sbRxClk  (ucie_sb_rx_clk),
-    .io_phy_sbRxData (ucie_sb_rx_data),
-    .io_phy_sbTxClk  (ucie_sb_tx_clk),
-    .io_phy_sbTxData (ucie_sb_tx_data),
+    // Sideband data and forwarded clocks, directly across the bumps
+    .io_phy_sbRxClk  (a2b_sb_clk),
+    .io_phy_sbRxData (a2b_sb_data),
+    .io_phy_sbTxClk  (b2a_sb_clk),
+    .io_phy_sbTxData (b2a_sb_data),
 
     // The analog clocking bypasses. Driven from the same clock so the digital
     // model has a running clock wherever the real design would take one from

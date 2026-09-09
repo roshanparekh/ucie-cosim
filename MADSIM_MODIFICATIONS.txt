@@ -3,12 +3,14 @@ MADSIM MODIFICATIONS
 Change log of modifications done to madsim
 
 Edited files:
-  cmod/phy_top/PhyLtsm/PhyLtsm.h
   cmod/phy_top/include/phy_spec.h
 
 ================================================================================
 1. PhyLtsm.h -- one-cycle hold after a sideband handoff
 ================================================================================
+Status: Fixed upstream in 7fd08862 by combinational sideband ready propagation.
+The local tx_cooldown workaround has been removed.
+
 Bug:
   Sideband::DriveTx returns ready to the LTSM through a register, so the ready
   PhyLtsm::Run reads is a cycle stale. On the cycle the CDC takes a message its
@@ -28,15 +30,6 @@ Bug:
   The lost request also stops the local pattern reader,
   so no result is produced and madsim waits on a response to a request it
   believes it made.
-
-Fix:
-  Hold the state machine for one cycle after a handoff, so the sideband can
-  register a message before it can be touched again. Costs one cycle per
-  sideband message.
-
-  See PhyLtsm.h:1241 for the tx_cooldown declaration and :1255 for the change
-  in Run(). Both are tagged "COSIM:".
-
 Why not a UcieTL fix:
   The message is lost inside madsim between SendMsg and the bump. The partner
   cannot request a retransmission, having no way to know a message was ever
@@ -53,11 +46,11 @@ Outcome without fixes:
 ================================================================================
 Both in cmod/phy_top/include/phy_spec.h, namespace phy_spec:
 
-  line 39   const int kStateTimeoutCycles
+  line 33   const int kStateTimeoutCycles
               was  10000
               now  6400000
 
-  line 46   const int kSbTrainingTimeoutCycles
+  line 36   const int kSbTrainingTimeoutCycles
               was  8 * kSbTrainingPhaseCycles   (= 3072)
               now  6400000
 
@@ -72,8 +65,12 @@ Outcome without fixes:
   reset wait. Nothing trains and no flit crosses in either direction.
 
 ================================================================================
-ISSUE, not fixed in madsim -- dropped sideband requests
+ISSUE, fixed upstream -- dropped sideband requests
 ================================================================================
+Status: Fixed upstream in 250baa39 by retaining requests until handled and
+correcting request acknowledgement during state transitions. The retry in
+Berkeley's SidebandMessageExchanger.scala has been removed.
+
 Every LTSM substate module clears an incoming request whether or not it
 services it. A request that arrives before the local die reaches the state that
 handles it is dropped, nothing retransmits it, and both dies wait out the
@@ -98,10 +95,17 @@ Outcome without fixes:
   stalls in MBINIT.REPAIRVAL. Every module needs the fix before a link trains,
   which is why this is worked around instead.
 
-Workaround:
+Previous workaround:
   SidebandMessageExchanger.scala re-sends an unanswered request after a dwell.
 
   UCIe does not define sideband message retransmission, so this retry is not
   spec behaviour. A conformant partner waits forever; anything that gets past
-  the defect is non-conformant. Remove the retry if madsim ever latches its
-  requests.
+  the defect is non-conformant.
+
+================================================================================
+Interface updates
+================================================================================
+madsim now exposes RVA data/valid/ready ports and sideband forwarded clocks.
+src/madsim_die.h binds the new ports. src/ucie_cosim_top.sv connects sideband
+data and clocks directly, and src/ucie_sb_shim.sv is removed. The monitor and
+probe sample sideband bits on falling forwarded-clock edges.

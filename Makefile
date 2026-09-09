@@ -27,7 +27,7 @@ TOP  := ucie_cosim_top
 SIMV := simv_cosim
 FSDB := $(WAVES)/ucie_cosim.fsdb
 
-TB_SRCS := $(SRC)/ucie_sb_shim.sv $(SRC)/cosim_monitor.sv $(SRC)/$(TOP).sv \
+TB_SRCS := $(SRC)/cosim_monitor.sv $(SRC)/$(TOP).sv \
            $(SRC)/cosim_probe.sv
 
 .PHONY: help elab cosim run wave verdi check-tree defs-stamp clean distclean
@@ -52,8 +52,7 @@ SC_DEFS := -DHLS_ALGORITHMICC -DHLS_CATAPULT -DVECTOR_SIZE=9 -DARRAY_SIZE=6 \
 TRAFFIC_MODE_NUM := $(strip $(if $(filter ucie_first,$(TRAFFIC_MODE)),1,\
                             $(if $(filter madsim_first,$(TRAFFIC_MODE)),2,0)))
 
-SC_DEFS += -DCOSIM_CLK_PERIOD_PS=$(CLK_PERIOD_PS) \
-           -DCOSIM_MADSIM_TX_MSGS=$(MADSIM_TX_MSGS) \
+SC_DEFS += -DCOSIM_MADSIM_TX_MSGS=$(MADSIM_TX_MSGS) \
            -DCOSIM_UCIE_TX_MSGS=$(UCIE_TX_MSGS) \
            -DCOSIM_TRAFFIC_MODE=$(TRAFFIC_MODE_NUM) \
            -DCOSIM_RANDOM_SEED=$(RANDOM_SEED)
