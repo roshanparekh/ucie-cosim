@@ -1,68 +1,16 @@
-diff --git a/cmod/phy_top/PhyLtsm/PhyLtsm.h b/cmod/phy_top/PhyLtsm/PhyLtsm.h
-index fd4b58dc..79d61a8d 100644
---- a/cmod/phy_top/PhyLtsm/PhyLtsm.h
-+++ b/cmod/phy_top/PhyLtsm/PhyLtsm.h
-@@ -1238,6 +1238,9 @@ SC_MODULE(PhyLtsm) {
-         }
-     }
- 
-+    // COSIM: one-cycle hold after a sideband handoff. Delete on revert.
-+    bool tx_cooldown = false;
-+
-     #pragma hls_iomode fixed
-     void Run() {
-         Reset();
-@@ -1249,8 +1252,26 @@ SC_MODULE(PhyLtsm) {
-             ObserveActiveStateRx();
-             ObserveSidebandError();
- 
-+            // COSIM: don't issue a message in the cycle after the sideband
-+            // took the last one.
-+            //
-+            // DriveTx returns ready through a register, so the ready read here
-+            // is a cycle stale. On the cycle the CDC latches a message its
-+            // in1_rdy drops, but the LTSM still sees the old high ready, takes
-+            // sb_tx_msg to be clear and overwrites it. Any state that answers a
-+            // request and issues its own back to back loses the second message,
-+            // and since sent_req_/sent_resp_ are set in SendMsg rather than on
-+            // handoff, it is recorded as sent and never retried.
-+            //
-+            // Costs one cycle per sideband message. To revert, drop
-+            // tx_handoff, tx_cooldown and its declaration, and restore:
-+            //     const bool tx_stalled =
-+            //         sb_tx_valid.read() && !sb_tx_ready.read();
-+            const bool tx_handoff =
-+                sb_tx_valid.read() && sb_tx_ready.read();
-             const bool tx_stalled =
--                sb_tx_valid.read() && !sb_tx_ready.read();
-+                (sb_tx_valid.read() && !sb_tx_ready.read()) || tx_cooldown;
-+            tx_cooldown = tx_handoff;
-             if (!tx_stalled) {
-                 OutputState out;
-                 DriveStatusOutputs(out);
 diff --git a/cmod/phy_top/include/phy_spec.h b/cmod/phy_top/include/phy_spec.h
-index a4dcf10c..636ab6c3 100644
+index a4dcf10c..adfb4f34 100644
 --- a/cmod/phy_top/include/phy_spec.h
 +++ b/cmod/phy_top/include/phy_spec.h
-@@ -30,10 +30,20 @@ namespace phy_spec {
+@@ -30,10 +30,10 @@ namespace phy_spec {
  
      // Timeout cycles
      const int kResetCycles = 10000;
 -    const int kStateTimeoutCycles = 10000;
-+    // MODIFIED for the UcieTL co-simulation. Original: 10000.
-+    // UcieTL's LTSM uses a 6,400,000 cycle per-substate timeout (8 ms at
-+    // 800 MHz, LinkTrainingSM.scala:99-100,120) and toggles its SBINIT
-+    // pattern on an 800,000 cycle period. At 10000 madsim declared
-+    // TRAINERROR during UcieTL's first SBINIT phase. Matched to UcieTL so
-+    // the partner's own error handling fires first.
 +    const int kStateTimeoutCycles = 6400000;
      const int kLinkErrorMinCycles = 10000;
      const int kSbTrainingPhaseCycles = 384;
 -    const int kSbTrainingTimeoutCycles = 8 * kSbTrainingPhaseCycles;
-+    // MODIFIED for the UcieTL co-simulation. Original: 8 * kSbTrainingPhaseCycles
-+    // (= 3072). kSbTrainingPhaseCycles is deliberately left at 384 because it
-+    // also shapes the transmitted sideband pattern (64 UI on, 32 off); only
-+    // the timeout is widened, so madsim's waveform is unchanged.
 +    const int kSbTrainingTimeoutCycles = 6400000;
  
      // Mainband

@@ -7,9 +7,9 @@
 //
 // It does three things a raw ucie_top cannot do at a Verilog boundary.
 //
-//   1. Binds rva_in / rva_out. These are matchlib Connections channels, which
-//      are transaction level and have no Verilog representation. This wrapper
-//      drives them, so madsim's protocol traffic is generated here.
+//   1. Drives the rva_in_data/val/rdy interface and drains rva_out_data/val/rdy.
+//      The protocol payloads are C++ structs, so traffic is generated here
+//      and only the physical and observation signals cross into Verilog.
 //
 //   2. Converts the lane bus and status ports from ac_int to bool and sc_uint,
 //      which syscan can bridge. The 16 mainband lanes stay 16 separate bools
@@ -27,12 +27,9 @@
 #include <systemc.h>
 #include "ucie_top.h"
 
-// Traffic and timing parameters. The Makefile defines all of these on the
+// Traffic parameters. The Makefile defines all of these on the
 // syscan command line and the matching +define+ on the vcs one, so the two
 // sides cannot drift. The fallbacks below only apply to a standalone compile.
-#ifndef COSIM_CLK_PERIOD_PS
-#define COSIM_CLK_PERIOD_PS 1250
-#endif
 #ifndef COSIM_MADSIM_TX_MSGS
 #define COSIM_MADSIM_TX_MSGS 2000
 #endif
@@ -73,12 +70,11 @@ SC_MODULE(madsim_die) {
   sc_in<bool> mb_rx_trk;
 
   // ---- sideband ------------------------------------------------------------
-  // Data plus a LEVEL valid. The shim converts this to and from UcieTL's
-  // gated forwarded clock; see src/ucie_sb_shim.sv.
+  // Data and a gated forwarded clock, wired directly to UcieTL's sideband.
   sc_out<bool> sb_tx_data;
-  sc_out<bool> sb_tx_val;
+  sc_out<bool> sb_tx_clk;
   sc_in<bool>  sb_rx_data;
-  sc_in<bool>  sb_rx_val;
+  sc_in<bool>  sb_rx_clk;
 
   // ---- observation only ----------------------------------------------------
   // RDI, the adapter to PHY boundary.
@@ -115,7 +111,7 @@ SC_MODULE(madsim_die) {
   sc_out<sc_uint<2> >  obs_mb_pattern_select;
 
   // Sideband transmit arbitration. PhyLtsm::Run skips runLTSM while tx_stalled,
-  // and DriveTx grants ready by strict priority (RDI, LTSM, CFG), so a
+  // and DriveReady grants ready by strict priority (RDI, LTSM, CFG), so a
   // persistent rdi_sb_tx_valid stops the state machine outright.
   // The message the LTSM is offering. A change while valid stays high with no
   // handoff means it was overwritten before the sideband took it. Low 64 bits
@@ -142,12 +138,6 @@ SC_MODULE(madsim_die) {
   // Flits received from the partner, counted in the observe method below.
   uint64_t rx_flit_count = 0;
 
-  // Connections finds its clock by walking the tree for an sc_clock, and the
-  // Verilog clock arrives as a plain sc_in<bool>, so the lookup fails with
-  // CONNECTIONS-111. This exists only to be found; end_of_elaboration aliases
-  // its posedge to the port's, and Verilog still drives the design.
-  sc_clock conn_ref_clk;
-
   // ac_int-typed nets that ucie_top actually binds to.
   sc_signal<phy_spec::LaneBits> mb_tx_data_int;
   sc_signal<phy_spec::LaneBits> mb_rx_data_int;
@@ -165,11 +155,12 @@ SC_MODULE(madsim_die) {
   sc_signal<bool>       st_trainerror;
   sc_signal<NVUINTW(5)> st_ltsm_state;
 
-  // Protocol-side channels, bound so elaboration succeeds.
-  Connections::Combinational<spec::Axi::SlaveToRVA::Write> chan_rva_in;
-  Connections::Combinational<spec::Axi::SlaveToRVA::Read>  chan_rva_out;
-  Connections::Out<spec::Axi::SlaveToRVA::Write> rva_in_src;
-  Connections::In<spec::Axi::SlaveToRVA::Read>   rva_out_sink;
+  // Protocol-side ready/valid signals. A transfer occurs on a clk posedge
+  // with both val and rdy high; the source holds data until that handshake.
+  sc_signal<spec::Axi::SlaveToRVA::Write> rva_in_data;
+  sc_signal<bool> rva_in_val, rva_in_rdy;
+  sc_signal<spec::Axi::SlaveToRVA::Read> rva_out_data;
+  sc_signal<bool> rva_out_val, rva_out_rdy;
 
   // ac_int<512> to sc_bv<512>, bit by bit. ac_int has no bulk accessor wide
   // enough and to_uint64 would silently truncate.
@@ -264,10 +255,11 @@ SC_MODULE(madsim_die) {
   // was sent rather than deriving it from the counter.
   //
   // It drops flits until its link FSM reaches ACTIVE, so the push waits for
-  // FDI. Connections ports still need one reset even if nothing is pushed;
-  // COSIM_MADSIM_TX_MSGS = 0 keeps the protocol side quiescent.
+  // FDI. COSIM_MADSIM_TX_MSGS = 0 keeps the protocol side quiescent.
   void drive_protocol_side() {
-    rva_in_src.Reset();
+    rva_in_data.write(spec::Axi::SlaveToRVA::Write());
+    rva_in_val.write(false);
+    wait();
 
     // xorshift64*, so the stream is reproducible from COSIM_RANDOM_SEED and
     // does not depend on the host's rand().
@@ -295,39 +287,22 @@ SC_MODULE(madsim_die) {
       req.data  = r2;
       req.wstrb = 0xff;  // all bytes of the 64-bit word
       req.rw    = 1;  // write
-      rva_in_src.Push(req);
+      rva_in_data.write(req);
+      rva_in_val.write(true);
+      do { wait(); } while (!rva_in_rdy.read());
+      rva_in_val.write(false);
     }
 
     while (true) wait();
   }
 
-  // The read-response channel has no consumer, so drain it. A full channel would
-  // back-pressure madsim's receive engine and stall its RX path.
+  // The read-response channel has no consumer, so drain it.
   void sink_protocol_side() {
-    rva_out_sink.Reset();
-    while (true) {
-      spec::Axi::SlaveToRVA::Read resp;
-      rva_out_sink.PopNB(resp);
-      wait();
-    }
+    rva_out_rdy.write(true);
+    while (true) wait();
   }
 
-  // Registered after port binding, because the alias stores the address of the
-  // port's event, and before start_of_simulation, which is when Connections
-  // resolves aliases.
-  void end_of_elaboration() {
-    Connections::get_sim_clk().add_clock_alias(conn_ref_clk.posedge_event(),
-                                               clk->posedge_event());
-  }
-
-  SC_CTOR(madsim_die)
-      : dut("dut"),
-        conn_ref_clk("conn_ref_clk", sc_time(COSIM_CLK_PERIOD_PS, SC_PS),
-                     0.5, SC_ZERO_TIME, true),
-        chan_rva_in("chan_rva_in"),
-        chan_rva_out("chan_rva_out"),
-        rva_in_src("rva_in_src"),
-        rva_out_sink("rva_out_sink") {
+  SC_CTOR(madsim_die) : dut("dut") {
 
     // One clock into all three madsim domains.
     dut.clk(clk);
@@ -335,10 +310,12 @@ SC_MODULE(madsim_die) {
     dut.mb_clk(clk);
     dut.rst(rst_n);
 
-    dut.rva_in(chan_rva_in);
-    dut.rva_out(chan_rva_out);
-    rva_in_src(chan_rva_in);
-    rva_out_sink(chan_rva_out);
+    dut.rva_in_data(rva_in_data);
+    dut.rva_in_val(rva_in_val);
+    dut.rva_in_rdy(rva_in_rdy);
+    dut.rva_out_data(rva_out_data);
+    dut.rva_out_val(rva_out_val);
+    dut.rva_out_rdy(rva_out_rdy);
 
     dut.mb_tx_data(mb_tx_data_int);
     dut.mb_tx_vld(mb_tx_vld);
@@ -353,9 +330,9 @@ SC_MODULE(madsim_die) {
     dut.mb_rx_trk(mb_rx_trk);
 
     dut.sb_tx_data(sb_tx_data);
-    dut.sb_tx_val(sb_tx_val);
+    dut.sb_tx_clk(sb_tx_clk);
     dut.sb_rx_data(sb_rx_data);
-    dut.sb_rx_val(sb_rx_val);
+    dut.sb_rx_clk(sb_rx_clk);
 
     dut.status_fdi_state(st_fdi_state);
     dut.status_fdi_inband_pres(st_fdi_inband_pres);
@@ -384,6 +361,7 @@ SC_MODULE(madsim_die) {
 
     SC_THREAD(drive_protocol_side);
     sensitive << clk.pos();
+    async_reset_signal_is(rst_n, false);
 
     SC_THREAD(sink_protocol_side);
     sensitive << clk.pos();
